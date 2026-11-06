@@ -415,7 +415,42 @@ impl Core {
             }
             _ => pick(Role::Writer)?,
         };
-        let reviewer = pick(Role::Reviewer)?;
+        // independent review prefers a SECOND runtime: exclude the writer adapter
+        // when any other gate-passing runtime exists (cross-tool review is the point)
+        let reviewer = (Role::Reviewer, {
+            let writer = writer.clone();
+            move |s: &AdapterRuntimeState| s.id != writer
+        });
+        let reviewer = {
+            let (role, exclude) = reviewer;
+            let mut chosen: Option<String> = None;
+            for cand in states.iter().filter(|s| s.available && exclude(s)) {
+                if !task.allowed_adapters.iter().any(|a| a == &cand.id) {
+                    continue;
+                }
+                if cand.id == "dsh" {
+                    continue;
+                }
+                if cand.simulated
+                    && task.allowed_adapters.len() > 1
+                    && states.iter().any(|s| !s.simulated && s.available && exclude(s) && task.allowed_adapters.iter().any(|a| a == &s.id))
+                {
+                    continue;
+                }
+                let ok = match role {
+                    Role::Writer => cand.write_ok,
+                    Role::Reviewer => cand.readonly_ok,
+                };
+                if ok {
+                    chosen = Some(cand.id.clone());
+                    break;
+                }
+            }
+            match chosen {
+                Some(c) => c,
+                None => pick(Role::Reviewer)?,
+            }
+        };
         let now = timestamp();
         let mut steps = vec![PlanStep {
             step_id: "s1".into(),
