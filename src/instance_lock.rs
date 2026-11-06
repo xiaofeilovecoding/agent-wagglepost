@@ -1,6 +1,6 @@
 //! Instance lock: one live wagglepost serve per managed root. Acquired BEFORE
 //! Store::open / recover / startup-code / cli-session writes (WP06).
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 pub struct InstanceGuard {
     #[cfg(windows)]
@@ -77,7 +77,7 @@ impl Drop for InstanceGuard {
 
 #[cfg(not(windows))]
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
+    use sha2::Digest as _;
     let mut h = Sha256::new();
     h.update(data);
     hex::encode(h.finalize())
@@ -90,7 +90,7 @@ fn proc_alive(_pid: u32) -> bool {
 
 #[cfg(windows)]
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
+    use sha2::Digest as _;
     let mut h = Sha256::new();
     h.update(data);
     hex::encode(h.finalize())
