@@ -138,9 +138,10 @@ impl Role {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Recipe {
+    #[default]
     Direct,
     WriteThenReview,
 }
@@ -216,7 +217,8 @@ pub struct PlanStep {
     pub handoff: Option<HandoffBody>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Plan {
     pub plan_id: String,
     pub task_id: String,
@@ -227,6 +229,10 @@ pub struct Plan {
     pub summary_hash: String,
     pub created_at: String,
     pub approved_at: Option<String>,
+    /// WP09: sha256 of the exact writer first-run body bound at approval time
+    pub approved_handoff_digest: Option<String>,
+    /// WP09: adapter → version bound at approval time; dispatch refuses drift
+    pub approved_versions: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -53,47 +53,60 @@ impl GitConfig {
     /// Detect repo-local execution mechanisms we cannot neutralize safely
     /// (external clean/smudge filters defined in the repository config).
     /// Such repos are refused with a stable reason at submit/trust.
-    pub fn repo_execution_mechanisms(repo: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        let dotgit = Path::new(repo).join(".git");
-        let config_file = if dotgit.is_file() {
-            match std::fs::read_to_string(&dotgit) {
-                Ok(text) => {
-                    let dir = text.trim().strip_prefix("gitdir:").map(|s| s.trim().to_string());
-                    match dir {
-                        Some(d) => PathBuf::from(d).join("config"),
-                        None => return found,
-                    }
-                }
-                Err(_) => return found,
+    /// Enumerate filter definitions with Git-native semantics (follows include,
+    /// includeIf, commondir for linked worktrees) and return -c overrides that
+    /// neutralize every external clean/smudge command with a guaranteed-failing
+    /// git invocation, so attacker commands never execute (WP02 0700).
+    pub fn filter_overrides(cfg: &GitConfig, repo: &str) -> Vec<String> {
+        let probe = std::process::Command::new(&cfg.git_exe)
+            .args(cfg.isolation_args())
+            .args(["config", "--get-regexp", r"^filter\..+\.(clean|smudge)$"])
+            .current_dir(Path::new(repo))
+            .env_clear()
+            .envs(git_min_env())
+            .envs(cfg.isolation_env())
+            .output();
+        let Ok(out) = probe else { return Vec::new() };
+        if !out.status.success() {
+            return Vec::new(); // no filters (or unreadable config: later git ops fail safely)
+        }
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if std::env::var("WAGGLEPOST_DEBUG_FILTERS").is_ok() {
+            let full = std::process::Command::new(&cfg.git_exe)
+                .args(cfg.isolation_args())
+                .args(["config", "--list", "--show-origin"])
+                .current_dir(Path::new(repo))
+                .env_clear()
+                .envs(git_min_env())
+                .envs(cfg.isolation_env())
+                .output();
+            eprintln!("[filters] probe status={} output={}", out.status, text.trim());
+            if let Ok(f) = full {
+                eprintln!("[filters] FULL CONFIG:
+{}", String::from_utf8_lossy(&f.stdout));
             }
-        } else {
-            dotgit.join("config")
-        };
-        if let Ok(text) = std::fs::read_to_string(&config_file) {
-            let mut in_filter = false;
-            let mut name = String::new();
-            for line in text.lines() {
-                let l = line.trim();
-                if l.starts_with('[') {
-                    in_filter = l.to_lowercase().starts_with("[filter");
-                    name = l
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .trim_start_matches("filter ")
-                        .replace('"', "")
-                        .trim()
-                        .to_string();
-                } else if in_filter {
-                    let lower = l.to_lowercase();
-                    if lower.starts_with("clean") || lower.starts_with("smudge") {
-                        found.push(format!("filter:{name}"));
+        }
+        let mut overrides = Vec::new();
+        let fail_cmd = format!(
+            "\"{}\" rev-parse --verify WAGGLEPOST_BLOCKED_FILTER_REF",
+            cfg.git_exe.to_string_lossy().replace('\\', "/")
+        );
+        for line in text.lines() {
+            // entries look like: filter.<name>.clean <command>
+            let Some((key, _)) = line.split_once(' ') else { continue };
+            let key = key.trim();
+            if let Some(rest) = key.strip_prefix("filter.") {
+                if let Some((name, side)) = rest.rsplit_once('.') {
+                    if side == "clean" || side == "smudge" {
+                        overrides.push("-c".into());
+                        overrides.push(format!("filter.{name}.{side}={fail_cmd}"));
                     }
                 }
             }
         }
-        found
+        overrides
     }
+
 }
 
 impl Default for GitConfig {
@@ -145,12 +158,19 @@ pub fn run_git(
     // on Windows (os error 267); retry spawn-level failures briefly
     let iso_args = cfg.isolation_args();
     let iso_env = cfg.isolation_env();
-    let mut full_args: Vec<&str> = Vec::with_capacity(args.len() + iso_args.len());
+    let filter_over = GitConfig::filter_overrides(cfg, cwd.to_string_lossy().as_ref());
+    let mut full_args: Vec<&str> = Vec::with_capacity(args.len() + iso_args.len() + filter_over.len());
     for a in &iso_args {
+        full_args.push(a.as_str());
+    }
+    for a in &filter_over {
         full_args.push(a.as_str());
     }
     for a in args {
         full_args.push(a);
+    }
+    if std::env::var("WAGGLEPOST_DEBUG_FILTERS").is_ok() {
+        eprintln!("[run_git] args={:?} over={:?}", args, filter_over);
     }
     let mut out = None;
     let mut last_err = String::new();

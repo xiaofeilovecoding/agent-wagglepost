@@ -409,7 +409,8 @@ async fn approve_plan(
         .and_then(|h| h.as_str())
         .unwrap_or("")
         .to_string();
-    match state.core.approve_plan(&id, &hash) {
+    let handoff_digest = body.get("handoff_digest").and_then(|h| h.as_str());
+    match state.core.approve_plan(&id, &hash, handoff_digest) {
         Ok(t) => {
             let receipt = routing::build_receipt("approve", &t, None, false);
             Json(json!({"task": t, "receipt": receipt})).into_response()

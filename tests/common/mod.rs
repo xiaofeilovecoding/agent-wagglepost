@@ -235,6 +235,70 @@ impl TestEnv {
         self.startup_code_value.clone()
     }
 
+    pub fn plan_hash(&self, task_id: &str) -> String {
+        self.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"]["summary_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// submit + trust + plan but NOT approve (caller approves with explicit material)
+    pub fn ready_task_unapproved(
+        &self,
+        recipe: &str,
+        writer: Option<&str>,
+        script: Option<Value>,
+    ) -> (String, String) {
+        let (task_id, _) = self.ready_task_with_budget_inner(recipe, writer, script, None, false);
+        (task_id, String::new())
+    }
+
+    pub fn ready_task_with_budget(
+        &self,
+        recipe: &str,
+        writer: Option<&str>,
+        script: Option<Value>,
+        resume_budget: u64,
+    ) -> (String, String) {
+        self.ready_task_with_budget_inner(recipe, writer, script, Some(resume_budget), true)
+    }
+
+    pub fn ready_task_with_budget_inner(
+        &self,
+        recipe: &str,
+        writer: Option<&str>,
+        script: Option<Value>,
+        resume_budget: Option<u64>,
+        approve: bool,
+    ) -> (String, String) {
+        let mut body = json!({
+            "goal": "append one demo line to lib.txt (offline simulated)",
+            "repo_path": self.user_repo.to_string_lossy(),
+            "recipe": recipe,
+            "allowed_adapters": ["fake"],
+        });
+        if let Some(w) = writer {
+            body["writer_adapter"] = json!(w);
+        }
+        if let Some(rb) = resume_budget {
+            body["resume_budget"] = json!(rb);
+        }
+        let resp = self
+            .req("POST", "/v1/tasks", Some(&body), Some(&format!("sub-{}", &new_token()[..8])))
+            .expect("submit");
+        let task_id = resp["task"]["task_id"].as_str().unwrap().to_string();
+        self.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).expect("trust");
+        let plan = self.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None).expect("plan");
+        if let Some(s) = &script {
+            self.core.store.meta_set(&format!("fake_script:{}:s1", task_id), &s.to_string());
+        }
+        let hash = plan["plan"]["summary_hash"].as_str().unwrap().to_string();
+        if approve {
+            self.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
+        }
+        (task_id, hash)
+    }
+
     pub fn ready_task_scoped(
         &self,
         recipe: &str,

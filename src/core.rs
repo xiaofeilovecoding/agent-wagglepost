@@ -327,18 +327,6 @@ Sample repository for the offline wagglepost tour.
         if !p.is_dir() {
             return Err(CoreError::bad("repo_missing", "repository path does not exist"));
         }
-        // repos whose config wires external filters (clean/smudge) execute code before
-        // runner permission control — refuse them with a stable reason (WP02)
-        let mechanisms = worktree::GitConfig::repo_execution_mechanisms(repo_path);
-        if !mechanisms.is_empty() {
-            return Err(CoreError::bad(
-                "repo_unsafe_git",
-                format!(
-                    "repository configures executable git mechanisms ({}); remove them or hand off manually",
-                    mechanisms.join(", ")
-                ),
-            ));
-        }
         worktree::resolve_head(&self.cfg.git, repo_path)
             .map_err(|e| CoreError::bad("repo_not_git", format!("not a git repository: {e}")))?;
         self.store
@@ -361,16 +349,6 @@ Sample repository for the offline wagglepost tour.
             input.repo_path.clone()
         };
         let repo_path = normalize_repo(&resolved_repo);
-        let mechanisms = worktree::GitConfig::repo_execution_mechanisms(&repo_path);
-        if !mechanisms.is_empty() {
-            return Err(CoreError::bad(
-                "repo_unsafe_git",
-                format!(
-                    "repository configures executable git mechanisms ({}); remove them or hand off manually",
-                    mechanisms.join(", ")
-                ),
-            ));
-        }
         let base = match &input.base_commit {
             Some(c) if !c.is_empty() => {
                 worktree::resolve_head(&self.cfg.git, &repo_path)
@@ -556,6 +534,8 @@ Sample repository for the offline wagglepost tour.
             steps,
             created_at: now.clone(),
             approved_at: None,
+            approved_handoff_digest: None,
+            approved_versions: None,
         };
         // attach route evaluation for the receipt (reasons why)
         self.store.insert_plan(&plan)?;
@@ -597,7 +577,12 @@ Sample repository for the offline wagglepost tour.
         Ok(ev)
     }
 
-    pub fn approve_plan(&self, task_id: &str, summary_hash: &str) -> Result<Task, CoreError> {
+    pub fn approve_plan(
+        &self,
+        task_id: &str,
+        summary_hash: &str,
+        handoff_digest: Option<&str>,
+    ) -> Result<Task, CoreError> {
         let task = self
             .store
             .get_task(task_id)
@@ -621,6 +606,30 @@ Sample repository for the offline wagglepost tour.
                 "confirm the repository before approving dispatch",
             ));
         }
+        // WP09: approval binds the EXACT writer first-run body (previewed by the user)
+        // and the adapter versions that will run. The digest is assembled server-side
+        // so the approved value is always the one dispatch will verify against.
+        let writer_step = plan
+            .steps
+            .iter()
+            .find(|s| s.role == Role::Writer)
+            .ok_or_else(|| CoreError::bad("no_candidate", "plan has no writer step"))?;
+        let approved_body = self.assemble_handoff(&task, writer_step, 1)?;
+        if let Some(d) = handoff_digest {
+            if d != approved_body.sha256 {
+                return Err(CoreError::conflict(
+                    "handoff_digest_mismatch",
+                    "the digest you approved does not match the body that would be sent; refresh the preview",
+                ));
+            }
+        }
+        let mut versions = serde_json::Map::new();
+        for st in &plan.steps {
+            versions.insert(st.adapter.clone(), Value::String(self.version_of(&st.adapter)));
+        }
+        let versions = Value::Object(versions);
+        self.store
+            .bind_plan_approval(&plan.plan_id, &approved_body.sha256, &versions)?;
         self.store.approve_plan(&plan.plan_id, &timestamp())?;
         let mut t = task;
         t.status = TaskStatus::Queued;
@@ -780,16 +789,13 @@ Sample repository for the offline wagglepost tour.
             return Err(CoreError::conflict("repo_untrusted", "repository is not trusted"));
         }
         if task.budget_remaining() <= 0 {
-            // the relay's paired reviewer re-run belongs to executing the approved
-            // reroute (it is still counted in launches_used for observability)
-            let paired_review = intent_was_set && next_step.role == Role::Reviewer;
-            if !paired_review {
-                return Err(CoreError::conflict(
-                    "budget_exhausted",
-                    "launch budget exhausted; increasing needs explicit approval",
-                ));
-            }
+            // WP10: the budget is strict — reroute discloses its full cost upfront
+            return Err(CoreError::conflict(
+                "budget_exhausted",
+                "launch budget exhausted; increasing needs explicit approval",
+            ));
         }
+        let _ = intent_was_set;
 
         // assemble handoff (local, deterministic)
         let generation = task.current_generation + 1;
@@ -800,6 +806,31 @@ Sample repository for the offline wagglepost tour.
                 "handoff_over_budget",
                 format!("handoff {} bytes exceeds budget {}", handoff.bytes, handoff.budget_bytes),
             ));
+        }
+
+        // WP09: the launched body must be the approved body (writer first run) and the
+        // runtime versions must still match what approval bound.
+        if let Some(approved_digest) = plan.approved_handoff_digest.as_deref() {
+            if next_step.role == Role::Writer && generation == 1 && approved_digest != handoff.sha256 {
+                return Err(CoreError::conflict(
+                    "handoff_not_approved",
+                    "the assembled body differs from the approved digest; refresh the preview and re-approve",
+                ));
+            }
+        }
+        if let Some(approved_versions) = &plan.approved_versions {
+            let bound = approved_versions.get(&next_step.adapter).and_then(|v| v.as_str());
+            if let Some(bound) = bound {
+                if bound != self.version_of(&next_step.adapter) {
+                    return Err(CoreError::conflict(
+                        "adapter_version_drift",
+                        format!(
+                            "{} runtime changed since approval (approved {}, now {}); re-approve the plan",
+                            next_step.adapter, bound, self.version_of(&next_step.adapter)
+                        ),
+                    ));
+                }
+            }
         }
 
         // create worktree BEFORE starting (workspace ownership persisted first)
@@ -1912,9 +1943,17 @@ failure_location: cp
                 Some(_) => {}
             }
         }
+        // WP04 (0700): acceptance must deliver a real patch — an export failure is a
+        // stable error and the task stays receivable; nothing is marked accepted.
         let exported = worktree::export_patch(&self.store, &self.cfg.git, &task, &cand)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+            .map_err(|e| {
+                CoreError::conflict(
+                    "patch_export_failed",
+                    format!("could not write the acceptance patch: {e}; fix the path and accept again"),
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
         let mut t = task;
         t.status = TaskStatus::Accepted;
         t.accepted_candidate_hash = Some(candidate_hash.to_string());
@@ -1986,23 +2025,7 @@ failure_location: cp
                 continue;
             };
             if task.budget_remaining() <= 0 {
-                let intent = self.store.meta_get(&format!("next_step:{}", &task.task_id));
-                let paired_review = intent
-                    .as_deref()
-                    .map(|sid| {
-                        self.store
-                            .latest_plan(&task.task_id)
-                            .map(|p| {
-                                p.steps
-                                    .iter()
-                                    .any(|s| s.step_id == sid && s.role == Role::Reviewer)
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !paired_review {
-                    continue;
-                }
+                continue;
             }
             // attempt dispatch with a synthetic scheduler request (idempotent per task+generation)
             let request_id = format!("sched:{}:{}:{}", task.task_id, task.current_generation, task.launches_used);

@@ -252,7 +252,7 @@ fn row_candidate(r: &Row) -> rusqlite::Result<Candidate> {
     })
 }
 
-const PLAN_COLS: &str = "plan_id,task_id,task_revision,recipe,steps,summary_hash,created_at,approved_at";
+const PLAN_COLS: &str = "plan_id,task_id,task_revision,recipe,steps,summary_hash,created_at,approved_at,approved_handoff_digest,approved_versions";
 
 fn row_plan(r: &Row) -> rusqlite::Result<Plan> {
     Ok(Plan {
@@ -264,6 +264,10 @@ fn row_plan(r: &Row) -> rusqlite::Result<Plan> {
         summary_hash: r.get(5)?,
         created_at: r.get(6)?,
         approved_at: r.get(7)?,
+        approved_handoff_digest: r.get(8)?,
+        approved_versions: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|v| serde_json::from_str(&v).ok()),
     })
 }
 
@@ -274,6 +278,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON").ok();
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // migrations for databases created before 0700 rework
+        let _ = conn.execute_batch("ALTER TABLE plans ADD COLUMN approved_handoff_digest TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE plans ADD COLUMN approved_versions TEXT;");
         Ok(Store {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -403,11 +410,29 @@ impl Store {
     pub fn insert_plan(&self, p: &Plan) -> Result<(), String> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            &format!("INSERT INTO plans({PLAN_COLS}) VALUES({})", placeholders(8)),
+            &format!("INSERT INTO plans({PLAN_COLS}) VALUES({})", placeholders(10)),
             params![
                 p.plan_id, p.task_id, p.task_revision, p.recipe.as_str(),
-                json_to(&p.steps), p.summary_hash, p.created_at, p.approved_at
+                json_to(&p.steps), p.summary_hash, p.created_at, p.approved_at,
+                p.approved_handoff_digest,
+                p.approved_versions.as_ref().map(|v| v.to_string())
             ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// WP09: bind the approved handoff digest and adapter versions at approval time.
+    pub fn bind_plan_approval(
+        &self,
+        plan_id: &str,
+        digest: &str,
+        versions: &Value,
+    ) -> Result<(), String> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE plans SET approved_handoff_digest=?2, approved_versions=?3 WHERE plan_id=?1",
+            params![plan_id, digest, versions.to_string()],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -423,6 +448,16 @@ impl Store {
             row_plan as RowMapper<Plan>,
         )
         .ok()
+    }
+
+    /// WP09 test/repair hook: overwrite the approved handoff digest on a plan.
+    pub fn set_plan_approved_digest(&self, plan_id: &str, digest: &str) {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE plans SET approved_handoff_digest=?2 WHERE plan_id=?1",
+            params![plan_id, digest],
+        )
+        .ok();
     }
 
     pub fn approve_plan(&self, plan_id: &str, approved_at: &str) -> Result<(), String> {
@@ -955,7 +990,8 @@ CREATE TABLE IF NOT EXISTS tasks(
 CREATE TABLE IF NOT EXISTS plans(
   plan_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, task_revision INTEGER NOT NULL,
   recipe TEXT NOT NULL, steps TEXT NOT NULL, summary_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL, approved_at TEXT
+  created_at TEXT NOT NULL, approved_at TEXT,
+  approved_handoff_digest TEXT, approved_versions TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_plans_task ON plans(task_id, created_at);
 CREATE TABLE IF NOT EXISTS attempts(
