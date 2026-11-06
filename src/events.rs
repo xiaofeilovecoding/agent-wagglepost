@@ -1,6 +1,5 @@
 use crate::model::*;
 use crate::store::Store;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -11,7 +10,6 @@ pub struct EventBus {
     counter: Mutex<u64>,
     /// flight-triggering event kinds (production animation subscribes to these)
     pub flight_kinds: Vec<&'static str>,
-    seq_padding: AtomicU64,
 }
 
 impl EventBus {
@@ -27,7 +25,6 @@ impl EventBus {
                 "reroute_started",
                 "result_collected",
             ],
-            seq_padding: AtomicU64::new(0),
         })
     }
 

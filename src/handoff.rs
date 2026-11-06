@@ -33,7 +33,7 @@ pub fn result_contract_footer(lang: &'static str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn assemble(
     mode: HandoffMode,
-    task: &Task,
+    _task: &Task,
     parts: HandoffParts,
     lang: &'static str,
     budget: usize,

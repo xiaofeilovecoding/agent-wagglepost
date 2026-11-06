@@ -1,6 +1,6 @@
 //! Process runner: Windows-native Job Object containment (assign BEFORE resume),
 //! piped stdin for the task body, capped stderr capture, stop with exit confirmation.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -517,7 +517,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
     }
 
     pub fn write_stdin_and_close(h: SendHandle, text: &str) {
-        let mut h = h.0;
+        let h = h.0;
         // blocking write; stdin pipes are 4KiB+ buffered, task bodies are ≤ budget + slack
         let bytes = text.as_bytes();
         let mut off = 0usize;
@@ -555,8 +555,6 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
 
 }
 
-#[cfg(windows)]
-use winproc::Job;
 
 /// Spawn the process inside a Job Object (contained before first instruction),
 /// start reader threads, write the stdin body, return the handle.

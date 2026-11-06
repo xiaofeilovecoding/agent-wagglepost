@@ -5,10 +5,9 @@
 use crate::adapters::{self, Adapter, DispatchContext, WireEvent};
 use crate::events::EventBus;
 use crate::handoff::{self, HandoffMode, HandoffParts};
-use crate::ids::{new_id, sha256_hex, short_hash};
+use crate::ids::{new_id, sha256_hex};
 use crate::model::*;
 use crate::routing::{self, AdapterRuntimeState, RouteInputs};
-use crate::runner::SpawnSpec;
 use crate::store::{timestamp, Store};
 use crate::worktree::{self, GitConfig};
 use serde_json::{json, Value};
@@ -248,8 +247,8 @@ Sample repository for the offline wagglepost tour.
     // ================= doctor =================
 
     pub fn doctor(&self) -> Value {
-        let codex_ok = self.cfg.codex_exe.is_file();
-        let claude_ok = self.cfg.claude_exe.is_file();
+        let _codex_ok = self.cfg.codex_exe.is_file();
+        let _claude_ok = self.cfg.claude_exe.is_file();
         let managed_ok = self.cfg.managed_root.is_dir()
             || std::fs::create_dir_all(self.cfg.managed_root.join("worktrees")).is_ok();
         let git_version = worktree::run_git(&self.cfg.git, std::path::Path::new("."), &["--version"], None)
@@ -760,7 +759,7 @@ Sample repository for the offline wagglepost tour.
         // assemble handoff (local, deterministic)
         let generation = task.current_generation + 1;
         let handoff = self.assemble_handoff(&task, &next_step, generation)?;
-        let body_digest = sha256_hex(handoff.text.as_bytes());
+        let _body_digest = sha256_hex(handoff.text.as_bytes());
         if handoff.bytes > handoff.budget_bytes {
             return Err(CoreError::bad(
                 "handoff_over_budget",
@@ -1339,7 +1338,7 @@ failure_location: cp
                 self.bus.emit(Some(task_id), Some(attempt_id), 0, "task_blocked", json!({"reason_code": "quota_blocked"}));
             }
             "blocked" if result.auth_required => {
-                let cp = self.save_checkpoint(task_id, attempt_id, result.blocked_reason.as_deref(), CheckpointSource::LocalObserved);
+                let _cp = self.save_checkpoint(task_id, attempt_id, result.blocked_reason.as_deref(), CheckpointSource::LocalObserved);
                 t.status = TaskStatus::AuthRequired;
                 t.updated_at = timestamp();
                 let _ = self.store.update_task(&t);
@@ -1379,7 +1378,7 @@ failure_location: cp
                 let _ = exit;
                 if t.recipe == Recipe::WriteThenReview && has_changes {
                     // freeze candidate then chain the reviewer
-                    match wt.as_ref().map(|w| worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation)) {
+                    match wt.as_ref().map(|_w| worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation)) {
                         Some(Ok(_cand)) => {
                             // a new candidate supersedes old-candidate reviews (kept as history)
                             self.store.mark_reviews_historical(task_id);
@@ -1410,7 +1409,7 @@ failure_location: cp
                 } else {
                     // direct recipe: candidate recorded; awaiting accept
                     if has_changes {
-                        if let Some(w) = &wt {
+                        if let Some(_w) = &wt {
                             if let Ok(_cand) = worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation) {
                                 let _ = _cand;
                             }
@@ -1780,7 +1779,7 @@ failure_location: cp
 
     // ================= accept =================
 
-    pub fn accept(self: &Arc<Self>, task_id: &str, candidate_hash: &str, request: &mut RequestRecord) -> Result<(Task, Value), CoreError> {
+    pub fn accept(self: &Arc<Self>, task_id: &str, candidate_hash: &str, _request: &mut RequestRecord) -> Result<(Task, Value), CoreError> {
         let task = self
             .store
             .get_task(task_id)
@@ -1868,7 +1867,7 @@ failure_location: cp
             if task.status != TaskStatus::Queued && task.status != TaskStatus::NeedsReview {
                 continue;
             }
-            let Some(plan) = self
+            let Some(_plan) = self
                 .store
                 .latest_plan(&task.task_id)
                 .filter(|p| p.approved_at.is_some() && p.task_revision == task.revision)

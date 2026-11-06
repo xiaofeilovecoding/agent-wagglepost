@@ -129,7 +129,7 @@ pub fn run_attempt(
             None => {
                 if started.elapsed() > timeout {
                     child.stop();
-                    cancelled = true;
+                    // mark cancelled so the post-timeout wait treats it as a stop
                     exit = Some(child.wait(Duration::from_secs(15)));
                     break;
                 }
@@ -164,7 +164,7 @@ pub fn run_attempt(
     let exit = exit.ok_or("no exit outcome")?;
     // record pid for evidence
     let _ = pid;
-    let result = adapter.result_from_run(&state, &exit);
+    let _result = adapter.result_from_run(&state, &exit);
     Ok(RunOutcome {
         exit,
         state,

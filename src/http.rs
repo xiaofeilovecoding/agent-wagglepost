@@ -12,7 +12,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -62,7 +62,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 // ---------------- auth ----------------
 
 fn host_ok(host: &str, port: u16) -> bool {
-    let h = host.rsplit(':').next().unwrap_or("");
+    let _h = host.rsplit(':').next().unwrap_or("");
     let h = if host.starts_with('[') {
         host.split(']').next().unwrap_or("").trim_start_matches('[')
     } else {
@@ -311,7 +311,7 @@ async fn trust_repo(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(_body): Json<Value>,
 ) -> Response {
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
@@ -495,7 +495,7 @@ async fn cancel_attempt(
         .or_else(|| body.get("request_id").and_then(|r| r.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| format!("auto-cancel-{}", new_token()));
     let digest = canonical_digest(&json!({"op": "cancel", "attempt": id}));
-    let mut rec = match state.core.begin_request(&request_id, "cancel", None, digest) {
+    let rec = match state.core.begin_request(&request_id, "cancel", None, digest) {
         Ok(r) => r,
         Err(e) => return core_error_response(&e),
     };

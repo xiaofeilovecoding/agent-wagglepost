@@ -1,7 +1,5 @@
 //! wagglepost — CLI + server entry. Same binary serves the loopback Web UI and the CLI.
 use serde_json::{json, Value};
-use std::io::Read;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wagglepost::core::{Core, CoreConfig};
