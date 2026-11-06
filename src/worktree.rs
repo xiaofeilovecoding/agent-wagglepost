@@ -55,20 +55,41 @@ pub fn run_git(
     args: &[&str],
     stdin: Option<&str>,
 ) -> Result<String, String> {
-    let out = std::process::Command::new(&cfg.git_exe)
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(git_min_env())
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("git spawn failed: {e}"))?;
+    // freshly created directories can transiently fail CreateProcess cwd validation
+    // on Windows (os error 267); retry spawn-level failures briefly
+    let mut out = None;
+    let mut last_err = String::new();
+    for attempt in 0..4 {
+        match std::process::Command::new(&cfg.git_exe)
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(git_min_env())
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(o) => {
+                out = Some(o);
+                break;
+            }
+            Err(e) => {
+                let retryable = matches!(e.raw_os_error(), Some(2) | Some(3) | Some(267));
+                last_err = format!("git spawn failed (cwd={}): {e}", cwd.display());
+                if retryable && attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    continue;
+                }
+                return Err(last_err);
+            }
+        }
+    }
+    let out = out.ok_or(last_err)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!(

@@ -193,6 +193,47 @@ impl Core {
         self.cfg.managed_root.clone()
     }
 
+    /// Managed demo repository for the 试样例 entry (offline, fake runtime only).
+    fn ensure_sample_repo(&self) -> Result<PathBuf, CoreError> {
+        let dir = self.cfg.managed_root.join("samples").join("demo-repo");
+        std::fs::create_dir_all(&dir).map_err(|e| CoreError::bad("managed_root_unwritable", e.to_string()))?;
+        if !dir.join(".git").exists() {
+            std::fs::write(dir.join("README.md"), "# demo
+
+Sample repository for the offline wagglepost tour.
+").ok();
+            // freshly created directories can transiently fail CreateProcess cwd
+            // validation on Windows; retry a few times before giving up
+            let mut last: Option<String> = None;
+            for _ in 0..4 {
+                let init = worktree::run_git(&self.cfg.git, &dir, &["init", "-q", "-b", "main"], None);
+                match init {
+                    Ok(_) => {
+                        last = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                }
+            }
+            if let Some(e) = last {
+                return Err(CoreError::bad("sample_repo_failed", e));
+            }
+            worktree::run_git(&self.cfg.git, &dir, &["add", "-A"], None)
+                .map_err(|e| CoreError::bad("sample_repo_failed", e))?;
+            worktree::run_git(
+                &self.cfg.git,
+                &dir,
+                &["-c", "user.name=wagglepost", "-c", "user.email=wagglepost@local", "commit", "-q", "-m", "demo baseline"],
+                None,
+            )
+            .map_err(|e| CoreError::bad("sample_repo_failed", e))?;
+        }
+        Ok(dir)
+    }
+
     fn ensure_managed_dirs(&self) -> Result<(), CoreError> {
         std::fs::create_dir_all(self.cfg.managed_root.join("worktrees")).map_err(|e| {
             CoreError::bad("managed_root_unwritable", format!("managed root: {e}"))
@@ -301,7 +342,14 @@ impl Core {
         if input.goal.trim().is_empty() {
             return Err(CoreError::bad("goal_required", "goal is required"));
         }
-        let repo_path = normalize_repo(&input.repo_path);
+        // "sample:demo" resolves to a managed demo repo (created on demand)
+        let resolved_repo = if input.repo_path.trim() == "sample:demo" {
+            let demo = self.ensure_sample_repo()?;
+            demo.to_string_lossy().to_string()
+        } else {
+            input.repo_path.clone()
+        };
+        let repo_path = normalize_repo(&resolved_repo);
         let base = match &input.base_commit {
             Some(c) if !c.is_empty() => {
                 worktree::resolve_head(&self.cfg.git, &repo_path)
