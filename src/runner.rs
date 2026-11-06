@@ -94,6 +94,56 @@ impl RunningChild {
         }
     }
 
+    /// WP07: stop counts only when the whole managed job is empty (every process in
+    /// the tree exited), not merely the root. Bounded; overruns are killed.
+    /// Returns (confirmed, killed_strays).
+    #[cfg(windows)]
+    pub fn confirm_tree_exit(&self, grace: Duration) -> (bool, bool) {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            {
+                let g = self.job.inner.lock().unwrap();
+                match g.as_ref() {
+                    Some(job) => {
+                        if job.process_count() == 0 {
+                            return (true, false);
+                        }
+                    }
+                    None => return (false, false),
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                {
+                    let g = self.job.inner.lock().unwrap();
+                    if let Some(job) = g.as_ref() {
+                        job.kill();
+                    }
+                }
+                let kill_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    {
+                        let g = self.job.inner.lock().unwrap();
+                        if let Some(job) = g.as_ref() {
+                            if job.process_count() == 0 {
+                                return (true, true);
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() > kill_deadline {
+                        return (false, true);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn confirm_tree_exit(&self, _grace: Duration) -> (bool, bool) {
+        (true, false) // non-Windows has no job containment; root exit is all we know
+    }
+
     /// Take the stdout line receiver (adapter parse loop owns it).
     pub fn take_lines(&self) -> Option<std::sync::mpsc::Receiver<String>> {
         self.lines_rx.lock().unwrap().take()
@@ -268,6 +318,32 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         pub fn wait(&self, timeout_ms: u32) -> bool {
             unsafe { WaitForSingleObject(self.proc, timeout_ms) == 0 }
         }
+        /// Live processes in the job. Query failure is treated as "empty" so a
+        /// conservative caller must not block forever on unobservable trees.
+        pub fn process_count(&self) -> u32 {
+            use windows_sys::Win32::System::JobObjects::{
+                JobObjectBasicProcessIdList, QueryInformationJobObject,
+            };
+            // 1024 pid slots + header
+            let mut buf = vec![0u8; 8 + 1024 * 8];
+            let mut ret: u32 = 0;
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.job,
+                    JobObjectBasicProcessIdList,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len() as u32,
+                    &mut ret,
+                )
+            };
+            if ok == 0 {
+                return 0;
+            }
+            // JOBOBJECT_BASIC_PROCESS_ID_LIST: DWORD assigned; DWORD inList; pids...
+            let count = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0u8; 4]));
+            count
+        }
+
         pub fn exit_code(&self) -> Option<i32> {
             let mut code: u32 = 259;
             unsafe {

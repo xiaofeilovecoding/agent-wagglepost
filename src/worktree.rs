@@ -10,6 +10,92 @@ pub struct GitConfig {
     pub managed_root: PathBuf,
 }
 
+impl GitConfig {
+    /// Paths of the isolation artifacts (created lazily): an empty hooks dir and an
+    /// empty global-config file, so no user hooks/filters/global config can execute.
+    pub fn isolation(&self) -> (PathBuf, PathBuf) {
+        let hooks = self.managed_root.join("git-isolation").join("empty-hooks");
+        let cfg = self.managed_root.join("git-isolation").join("empty-config");
+        let _ = std::fs::create_dir_all(&hooks);
+        let _ = std::fs::create_dir_all(cfg.parent().unwrap());
+        if !cfg.exists() {
+            let _ = std::fs::write(&cfg, "");
+        }
+        (hooks, cfg)
+    }
+
+    /// -c overrides that neutralize executable repo mechanisms for every product git call.
+    pub fn isolation_args(&self) -> Vec<String> {
+        let (hooks, _) = self.isolation();
+        vec![
+            "-c".into(),
+            format!("core.hooksPath={}", hooks.to_string_lossy()),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+            "-c".into(),
+            "commit.gpgsign=false".into(),
+            "-c".into(),
+            "tag.gpgsign=false".into(),
+        ]
+    }
+
+    /// Env that blocks global/system/attr execution paths.
+    pub fn isolation_env(&self) -> Vec<(String, String)> {
+        let (_, cfg) = self.isolation();
+        vec![
+            ("GIT_CONFIG_GLOBAL".into(), cfg.to_string_lossy().to_string()),
+            ("GIT_CONFIG_SYSTEM".into(), cfg.to_string_lossy().to_string()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("GIT_ATTR_NOSYSTEM".into(), "1".into()),
+        ]
+    }
+
+    /// Detect repo-local execution mechanisms we cannot neutralize safely
+    /// (external clean/smudge filters defined in the repository config).
+    /// Such repos are refused with a stable reason at submit/trust.
+    pub fn repo_execution_mechanisms(repo: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let dotgit = Path::new(repo).join(".git");
+        let config_file = if dotgit.is_file() {
+            match std::fs::read_to_string(&dotgit) {
+                Ok(text) => {
+                    let dir = text.trim().strip_prefix("gitdir:").map(|s| s.trim().to_string());
+                    match dir {
+                        Some(d) => PathBuf::from(d).join("config"),
+                        None => return found,
+                    }
+                }
+                Err(_) => return found,
+            }
+        } else {
+            dotgit.join("config")
+        };
+        if let Ok(text) = std::fs::read_to_string(&config_file) {
+            let mut in_filter = false;
+            let mut name = String::new();
+            for line in text.lines() {
+                let l = line.trim();
+                if l.starts_with('[') {
+                    in_filter = l.to_lowercase().starts_with("[filter");
+                    name = l
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .trim_start_matches("filter ")
+                        .replace('"', "")
+                        .trim()
+                        .to_string();
+                } else if in_filter {
+                    let lower = l.to_lowercase();
+                    if lower.starts_with("clean") || lower.starts_with("smudge") {
+                        found.push(format!("filter:{name}"));
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
 impl Default for GitConfig {
     fn default() -> Self {
         GitConfig {
@@ -57,14 +143,24 @@ pub fn run_git(
 ) -> Result<String, String> {
     // freshly created directories can transiently fail CreateProcess cwd validation
     // on Windows (os error 267); retry spawn-level failures briefly
+    let iso_args = cfg.isolation_args();
+    let iso_env = cfg.isolation_env();
+    let mut full_args: Vec<&str> = Vec::with_capacity(args.len() + iso_args.len());
+    for a in &iso_args {
+        full_args.push(a.as_str());
+    }
+    for a in args {
+        full_args.push(a);
+    }
     let mut out = None;
     let mut last_err = String::new();
     for attempt in 0..4 {
         match std::process::Command::new(&cfg.git_exe)
-            .args(args)
+            .args(&full_args)
             .current_dir(cwd)
             .env_clear()
             .envs(git_min_env())
+            .envs(iso_env.clone())
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -297,7 +393,29 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Freeze the candidate: commit all changes (tracked + untracked) on a detached head in the writer
+/// Component-wise path authorization: forbidden always wins; empty allowed = whole tree.
+pub fn path_allowed(rel: &str, allowed: &[String], forbidden: &[String]) -> bool {
+    let norm = rel.replace('\\', "/").trim_start_matches('/').to_string();
+    if norm.is_empty() {
+        return false;
+    }
+    let under = |base: &str| -> bool {
+        let b = base.replace('\\', "/").trim_matches('/').to_string();
+        if b.is_empty() {
+            return true;
+        }
+        norm == b || norm.starts_with(&format!("{b}/"))
+    };
+    if forbidden.iter().any(|f| under(f)) {
+        return false;
+    }
+    if allowed.is_empty() {
+        return true;
+    }
+    allowed.iter().any(|a| under(a))
+}
+
+/// Freeze the candidate:/// Freeze the candidate: commit all changes (tracked + untracked) on a detached head in the writer
 /// worktree. Returns the frozen commit hash. The user repo is never touched.
 pub fn freeze_candidate(
     store: &Store,
@@ -324,7 +442,7 @@ pub fn freeze_candidate(
         None,
     )?;
     let commit = run_git(cfg, p, &["rev-parse", "HEAD"], None)?.trim().to_string();
-    let obs = pre;
+    let _obs = pre;
     // patch export: diff base..commit
     let patch = run_git(
         cfg,
@@ -332,6 +450,37 @@ pub fn freeze_candidate(
         &["diff", "--binary", &task.base_commit, &commit],
         None,
     )?;
+    // full change enumeration from the frozen tree (WP03): added/deleted/renamed/modified
+    let name_status = run_git(
+        cfg,
+        p,
+        &["diff", "--name-status", "-M", &task.base_commit, &commit],
+        None,
+    )?;
+    let mut changed_files_full: Vec<String> = Vec::new();
+    for line in name_status.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let _status = parts.next().unwrap_or("");
+        // rename lines carry two paths; the NEW path is the one in the candidate
+        let path = parts.next_back().unwrap_or("").to_string();
+        if !path.is_empty() {
+            changed_files_full.push(path);
+        }
+    }
+    let out_of_scope: Vec<String> = changed_files_full
+        .iter()
+        .filter(|f| !path_allowed(f, &task.allowed_paths, &task.forbidden_paths))
+        .cloned()
+        .collect();
+    if !out_of_scope.is_empty() {
+        return Err(format!(
+            "OUT_OF_SCOPE: {}",
+            out_of_scope.join(", ")
+        ));
+    }
     // candidate hash is bound to the actual delta content (base + patch)
     let chash = {
         use sha2::Digest;
@@ -356,7 +505,7 @@ pub fn freeze_candidate(
         attempt_id: attempt_id.to_string(),
         base_commit: task.base_commit.clone(),
         frozen_commit: Some(commit),
-        changed_files: obs.changed_files,
+        changed_files: changed_files_full,
         untracked_files: vec![], // frozen into the commit
         patch_path: Some(patch_dir.join(format!("{}.patch", task.task_id)).to_string_lossy().to_string()),
         label: String::new(),

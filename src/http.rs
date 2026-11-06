@@ -82,6 +82,11 @@ async fn guard(
     cookie_session_ok: bool,
     bearer_ok: bool,
 ) -> Result<(), Response> {
+    // 0. Authentication: every guarded endpoint (GET and SSE included) requires an
+    //    exact session cookie or the CLI bearer; static assets and /v1/health stay public.
+    if !bearer_ok && !cookie_session_ok {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "auth_required", "authenticate via the startup code or the CLI bearer token"));
+    }
     // 1. Host check (DNS rebinding)
     let host = headers
         .get("host")
@@ -124,16 +129,28 @@ async fn guard(
 
 /// Combined auth: either a valid bearer token (CLI) or the session cookie (web).
 /// Returns (is_bearer,) — CSRF already validated in guard for cookie callers.
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    // exact name/value parse: "xwp_session=..." must NOT authenticate
+    let raw = headers.get("cookie").and_then(|v| v.to_str().ok())?;
+    for pair in raw.split(';') {
+        let pair = pair.trim();
+        if let Some((name, value)) = pair.split_once('=') {
+            if name.trim() == "wp_session" {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 fn auth_context(state: &SharedState, headers: &HeaderMap) -> (bool, bool) {
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(|v| v == format!("Bearer {}", state.session_token))
         .unwrap_or(false);
-    let cookie = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(|c| c.contains(&format!("wp_session={}", state.session_token)))
+    let cookie = session_cookie(headers)
+        .map(|v| v == state.session_token)
         .unwrap_or(false);
     (bearer, cookie)
 }
@@ -155,11 +172,12 @@ fn core_error_response(e: &CoreError) -> Response {
 // ---------------- handlers ----------------
 
 async fn health(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    let (bearer, cookie) = auth_context(&state, &headers);
-    match guard(&state, &Method::GET, &headers, cookie, bearer).await {
-        Ok(()) => Json(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})).into_response(),
-        Err(r) => r,
+    // public health check: host validation only, no auth (WP01 allowlist)
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !host_ok(host, state.port) {
+        return error_response(StatusCode::FORBIDDEN, "bad_host", "Host must be the loopback address of this server");
     }
+    Json(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})).into_response()
 }
 
 async fn create_session(
@@ -167,14 +185,24 @@ async fn create_session(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    // the code exchange runs before any session exists: validate Host strictly and
+    // require a same-origin Origin header (browsers always send one on POST)
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !host_ok(host, state.port) {
+        return error_response(StatusCode::FORBIDDEN, "bad_host", "Host must be the loopback address of this server");
+    }
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let expected_origin = format!("http://127.0.0.1:{}", state.port);
+    let expected_origin2 = format!("http://localhost:{}", state.port);
+    if origin != expected_origin && origin != expected_origin2 {
+        return error_response(StatusCode::FORBIDDEN, "bad_origin", "code exchange requires the loopback origin");
+    }
     // one-time startup code exchange
     let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
-    let expected = state.core.store.meta_get("startup_code").unwrap_or_default();
-    if expected.is_empty() || code != expected {
+        // atomic single-use consumption: concurrent exchanges, exactly one wins
+    if code.is_empty() || !state.core.store.consume_startup_code(code) {
         return error_response(StatusCode::FORBIDDEN, "bad_code", "startup code rejected");
     }
-    // burn the code
-    state.core.store.meta_set("startup_code", "");
     let cookie = format!(
         "wp_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
         state.session_token
@@ -242,29 +270,45 @@ async fn create_task(
         .map(|s| s.to_string())
         .or_else(|| body.get("request_id").and_then(|r| r.as_str()).map(|s| s.to_string()));
     let digest = canonical_digest(&body);
-    let request_id = match request_id {
+    let (request_id, rec) = match request_id {
         Some(rid) if !rid.is_empty() => {
             match state.core.begin_request(&rid, "submit", None, digest) {
                 Ok(rec) if rec.status == "completed" && !rec.result.is_null() => {
                     return Json(rec.result).into_response();
                 }
-                Ok(_) => rid,
+                Ok(rec) => (rid, Some(rec)),
                 Err(e) => return core_error_response(&e),
             }
         }
-        _ => format!("auto-{}", new_token()),
+        _ => (format!("auto-{}", new_token()), None),
     };
     let input = match parse_submit(&body) {
         Ok(i) => i,
-        Err(e) => return core_error_response(&e),
+        Err(e) => {
+            if let Some(rec) = rec {
+                state.core.fail_request(rec, json!({"error": "submit validation failed"}));
+            }
+            return core_error_response(&e);
+        }
     };
     match state.core.submit(input) {
         Ok(t) => {
             let receipt = routing::build_receipt(&request_id, &t, None, false);
             state.core.store.meta_set(&format!("last_request:{}", t.task_id), &request_id);
-            Json(json!({"task": t, "receipt": receipt})).into_response()
+            let result = json!({"task": t, "receipt": receipt});
+            // persist the completed receipt so replays return the SAME task (WP05)
+            if let Some(mut rec) = rec {
+                rec.task_id = Some(t.task_id.clone());
+                state.core.finish_request(rec, result.clone(), None);
+            }
+            Json(result).into_response()
         }
-        Err(e) => core_error_response(&e),
+        Err(e) => {
+            if let Some(rec) = rec {
+                state.core.fail_request(rec, json!({"error": {"code": e.code.clone(), "message": e.message.clone()}}));
+            }
+            core_error_response(&e)
+        }
     }
 }
 
@@ -298,7 +342,10 @@ fn parse_submit(body: &Value) -> Result<SubmitInput, CoreError> {
         goal,
         acceptance: arr("acceptance"),
         repo_path,
-        base_commit: body.get("base_commit").and_then(|b| b.as_str()).map(|s| s.to_string()),
+        base_commit: body
+            .get("base_commit")
+            .and_then(|b| b.as_str())
+            .map(|s| s.to_string()),
         allowed_paths: arr("allowed_paths"),
         forbidden_paths: arr("forbidden_paths"),
         recipe,

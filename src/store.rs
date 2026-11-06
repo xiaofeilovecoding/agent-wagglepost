@@ -307,6 +307,17 @@ impl Store {
             .ok()
             .flatten()
     }
+    /// Atomic single-use startup code consumption: exactly one caller wins.
+    pub fn consume_startup_code(&self, code: &str) -> bool {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE meta SET v='' WHERE k='startup_code' AND v=?1",
+            params![code],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
     pub fn meta_set(&self, key: &str, value: &str) {
         let c = self.conn.lock().unwrap();
         c.execute(

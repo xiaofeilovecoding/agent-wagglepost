@@ -23,6 +23,9 @@ pub struct DispatchContext {
     pub fake_script: Option<Value>,
     pub timeout_secs: u64,
     pub fake_exe: Option<std::path::PathBuf>,
+    /// candidate the REVIEWER is bound to at launch (WP04: identity from the start
+    /// of the run, not re-read from the current candidate at finish)
+    pub bound_candidate_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -122,7 +125,12 @@ pub fn run_attempt(
         }
         // do we have an exit already? peek by waiting a tick
         match child.poll_exit_short() {
-            Some(outcome) => {
+            Some(mut outcome) => {
+                // WP07: the root exited but the tree may still hold live children —
+                // stop evidence requires the whole managed job to be empty.
+                let (confirmed, killed_strays) = child.confirm_tree_exit(Duration::from_secs(30));
+                outcome.stop_confirmed = confirmed;
+                outcome.killed = outcome.killed || killed_strays;
                 exit = Some(outcome);
                 break;
             }

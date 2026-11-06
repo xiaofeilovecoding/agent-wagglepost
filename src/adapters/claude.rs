@@ -8,6 +8,20 @@ use crate::model::AgentResult;
 use crate::runner::{ExitOutcome, SpawnSpec};
 use serde_json::{json, Value};
 
+/// Truncate to a UTF-8 char boundary at or below max_bytes; never panics on
+/// multibyte input (WP08).
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.as_bytes().len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let ellipsis = "\u{2026}";
+    format!("{}{}", &s[..end], ellipsis)
+}
+
 pub struct ClaudeAdapter {
     /// resolved command name/path (claude.cmd requires going through node)
     pub cmd: String,
@@ -132,7 +146,7 @@ impl Adapter for ClaudeAdapter {
                                 let input = block.get("input").cloned().unwrap_or(Value::Null);
                                 // bound the echoed input (avoid huge payloads)
                                 let input_s = serde_json::to_string(&input).unwrap_or_default();
-                                let input_s = if input_s.len() > 400 { format!("{}…", &input_s[..400.min(input_s.len())]) } else { input_s };
+                                let input_s = truncate_utf8(&input_s, 400);
                                 events.push(WireEvent {
                                     kind: "agent_tool".into(),
                                     payload: json!({"tool": name, "input": input_s}),

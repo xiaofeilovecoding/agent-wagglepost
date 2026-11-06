@@ -83,10 +83,18 @@ fn cmd_serve(args: Vec<String>) -> i32 {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async move {
-        let db_path = wagglepost::worktree::default_managed_root().join("wagglepost.db");
-        if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let managed_root = wagglepost::worktree::default_managed_root();
+        std::fs::create_dir_all(&managed_root).ok();
+        // WP06: the instance lock is acquired BEFORE Store::open / recover / any
+        // authentication material (startup code, cli-session) is created or replaced.
+        let _guard = match wagglepost::instance_lock::acquire(&managed_root) {
+            Ok(g) => g,
+            Err(msg) => {
+                eprintln!("refusing to start: {msg}");
+                return 3;
+            }
+        };
+        let db_path = managed_root.join("wagglepost.db");
         let store = match Store::open(&db_path) {
             Ok(s) => s,
             Err(e) => {
@@ -100,13 +108,20 @@ fn cmd_serve(args: Vec<String>) -> i32 {
         for n in notes {
             eprintln!("[recover] {n}");
         }
-        // startup code for the web session (one-time)
+        // bind BEFORE handing out credentials: a failed bind must not mint a new session
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("failed to bind {addr}: {e}");
+                return 3;
+            }
+        };
         let session_token = new_token();
         let csrf = new_token();
         let startup_code = wagglepost::ids::new_token()[..8].to_string();
         core.store.meta_set("startup_code", &startup_code);
-        // CLI channel: token file inside managed root (local user only)
-        let cli_file = core.managed_root().join("cli-session.json");
+        let cli_file = managed_root.join("cli-session.json");
         let _ = std::fs::write(
             &cli_file,
             json!({"port": port, "token": session_token, "csrf": csrf}).to_string(),
@@ -117,19 +132,10 @@ fn cmd_serve(args: Vec<String>) -> i32 {
             csrf_token: csrf,
             port,
         });
-        // static UI
         let ui_router = router(state).fallback(wagglepost::ui::static_handler);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("failed to bind {addr}: {e}");
-                return 3;
-            }
-        };
         eprintln!("蜂递 WagglePost serving on http://127.0.0.1:{port}");
         eprintln!("startup code: {startup_code}");
-        eprintln!("managed root: {}", core.managed_root().display());
+        eprintln!("managed root: {}", managed_root.display());
         eprintln!("cli session: {}", cli_file.display());
         // scheduler loop
         let sched_core = core.clone();

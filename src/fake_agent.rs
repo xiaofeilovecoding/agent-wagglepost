@@ -12,6 +12,13 @@ pub fn run(args: &[String]) -> i32 {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    // child-process mode FIRST (no script needed): sleep then exit — used by the
+    // spawn_child behavior so the root exits while a job child still runs (WP07)
+    if let Some(secs) = flag_value("--child-sleep") {
+        let secs: u64 = secs.parse().unwrap_or(0);
+        std::thread::sleep(Duration::from_secs(secs));
+        return 0;
+    }
     let script_path = match flag_value("--script") {
         Some(p) => p,
         None => {
@@ -75,6 +82,20 @@ pub fn run(args: &[String]) -> i32 {
     if has("hang") {
         let secs = script.get("hang_secs").and_then(|h| h.as_u64()).unwrap_or(600);
         std::thread::sleep(Duration::from_secs(secs));
+    }
+    if has("spawn_child") {
+        // spawn a job child that outlives the root by child_secs seconds
+        let secs = script.get("child_secs").and_then(|h| h.as_u64()).unwrap_or(3);
+        let exe = std::env::current_exe().ok();
+        if let Some(exe) = exe {
+            let _ = std::process::Command::new(exe)
+                .args(["__fake-agent", "--child-sleep", &secs.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        out(json!({"fake": "1", "type": "message", "text": "child spawned", "simulated": true}));
     }
     if let Some(msgs) = script.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {

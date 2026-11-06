@@ -327,6 +327,18 @@ Sample repository for the offline wagglepost tour.
         if !p.is_dir() {
             return Err(CoreError::bad("repo_missing", "repository path does not exist"));
         }
+        // repos whose config wires external filters (clean/smudge) execute code before
+        // runner permission control — refuse them with a stable reason (WP02)
+        let mechanisms = worktree::GitConfig::repo_execution_mechanisms(repo_path);
+        if !mechanisms.is_empty() {
+            return Err(CoreError::bad(
+                "repo_unsafe_git",
+                format!(
+                    "repository configures executable git mechanisms ({}); remove them or hand off manually",
+                    mechanisms.join(", ")
+                ),
+            ));
+        }
         worktree::resolve_head(&self.cfg.git, repo_path)
             .map_err(|e| CoreError::bad("repo_not_git", format!("not a git repository: {e}")))?;
         self.store
@@ -349,6 +361,16 @@ Sample repository for the offline wagglepost tour.
             input.repo_path.clone()
         };
         let repo_path = normalize_repo(&resolved_repo);
+        let mechanisms = worktree::GitConfig::repo_execution_mechanisms(&repo_path);
+        if !mechanisms.is_empty() {
+            return Err(CoreError::bad(
+                "repo_unsafe_git",
+                format!(
+                    "repository configures executable git mechanisms ({}); remove them or hand off manually",
+                    mechanisms.join(", ")
+                ),
+            ));
+        }
         let base = match &input.base_commit {
             Some(c) if !c.is_empty() => {
                 worktree::resolve_head(&self.cfg.git, &repo_path)
@@ -627,6 +649,13 @@ Sample repository for the offline wagglepost tour.
     ) -> Result<RequestRecord, CoreError> {
         if let Some(existing) = self.store.get_request(request_id) {
             if existing.digest == body_digest {
+                if existing.status == "processing" {
+                    // a same-key concurrent call may not double-execute; retry later
+                    return Err(CoreError::conflict(
+                        "request_in_flight",
+                        "this request id is still being processed; query it instead of re-sending",
+                    ));
+                }
                 return Ok(existing); // replay
             }
             return Err(CoreError::conflict(
@@ -696,6 +725,7 @@ Sample repository for the offline wagglepost tour.
         // explicit relay/resume intent (set by reroute/answer) names the step to re-run;
         // otherwise pick the first fresh step (never attempted, deps done)
         let next_step_id = self.store.meta_get(&format!("next_step:{}", task_id));
+        let intent_was_set = next_step_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
         let next_step = match next_step_id {
             Some(sid) if !sid.is_empty() => {
                 self.store.meta_set(&format!("next_step:{}", task_id), "");
@@ -750,10 +780,15 @@ Sample repository for the offline wagglepost tour.
             return Err(CoreError::conflict("repo_untrusted", "repository is not trusted"));
         }
         if task.budget_remaining() <= 0 {
-            return Err(CoreError::conflict(
-                "budget_exhausted",
-                "launch budget exhausted; increasing needs explicit approval",
-            ));
+            // the relay's paired reviewer re-run belongs to executing the approved
+            // reroute (it is still counted in launches_used for observability)
+            let paired_review = intent_was_set && next_step.role == Role::Reviewer;
+            if !paired_review {
+                return Err(CoreError::conflict(
+                    "budget_exhausted",
+                    "launch budget exhausted; increasing needs explicit approval",
+                ));
+            }
         }
 
         // assemble handoff (local, deterministic)
@@ -848,6 +883,11 @@ Sample repository for the offline wagglepost tour.
             fake_script: self.fake_script_for(&task, &next_step, generation),
             timeout_secs: task.timeout_secs,
             fake_exe: self.cfg.fake_exe.clone(),
+            bound_candidate_hash: if next_step.role == Role::Reviewer {
+                self.store.current_candidate(task_id).map(|c| c.candidate_hash)
+            } else {
+                None
+            },
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flags
@@ -1266,7 +1306,7 @@ failure_location: cp
         if attempt.role == Role::Writer {
             self.finish_writer(task_id, attempt_id, ctx, &task, &result, &res.state, &res.exit);
         } else {
-            self.finish_reviewer(task_id, attempt_id, &task, &result, &res.state);
+            self.finish_reviewer(task_id, attempt_id, ctx, &task, &result, &res.state);
         }
     }
 
@@ -1382,6 +1422,20 @@ failure_location: cp
                         Some(Ok(_cand)) => {
                             // a new candidate supersedes old-candidate reviews (kept as history)
                             self.store.mark_reviews_historical(task_id);
+                            // re-run the reviewer for the new candidate (same-generation
+                            // guard still prevents double dispatch within one generation)
+                            let reviewer_step = self
+                                .store
+                                .latest_plan(task_id)
+                                .and_then(|p| {
+                                    p.steps
+                                        .iter()
+                                        .find(|s| s.role == Role::Reviewer)
+                                        .map(|s| s.step_id.clone())
+                                });
+                            if let Some(step) = reviewer_step {
+                                self.store.meta_set(&format!("next_step:{}", task_id), &step);
+                            }
                             t.status = TaskStatus::NeedsReview;
                             t.updated_at = timestamp();
                             let _ = self.store.update_task(&t);
@@ -1400,6 +1454,13 @@ failure_location: cp
                             t.updated_at = timestamp();
                             let _ = self.store.update_task(&t);
                             self.upsert_inbox(task_id, "blocked", json!({"task_id": task_id, "reason": format!("freeze failed: {e}")}), format!("blocked:{}:{}", task_id, t.current_generation));
+                            self.bus.emit(
+                                Some(task_id),
+                                Some(attempt_id),
+                                t.current_generation,
+                                "task_blocked",
+                                json!({"reason": e}),
+                            );
                         }
                         None => {
                             t.status = TaskStatus::Interrupted;
@@ -1409,10 +1470,22 @@ failure_location: cp
                 } else {
                     // direct recipe: candidate recorded; awaiting accept
                     if has_changes {
-                        if let Some(_w) = &wt {
-                            if let Ok(_cand) = worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation) {
-                                let _ = _cand;
-                            }
+                        let frozen = wt
+                            .as_ref()
+                            .map(|_w| worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation));
+                        if let Some(Err(e)) = frozen {
+                            t.status = TaskStatus::Interrupted;
+                            t.updated_at = timestamp();
+                            let _ = self.store.update_task(&t);
+                            self.upsert_inbox(task_id, "blocked", json!({"task_id": task_id, "reason": format!("freeze failed: {e}")}), format!("blocked:{}:{}", task_id, t.current_generation));
+                            self.bus.emit(
+                                Some(task_id),
+                                Some(attempt_id),
+                                t.current_generation,
+                                "task_blocked",
+                                json!({"reason": e}),
+                            );
+                            return;
                         }
                         t.status = TaskStatus::NeedsReview;
                         t.updated_at = timestamp();
@@ -1445,15 +1518,26 @@ failure_location: cp
         self: &Arc<Self>,
         task_id: &str,
         attempt_id: &str,
+        ctx: &DispatchContext,
         task: &Task,
         result: &AgentResult,
         state: &adapters::RunState,
     ) {
-        let cand = self.store.current_candidate(task_id);
+        // the reviewed candidate is the one bound at reviewer launch (WP04)
+        let bound = ctx
+            .bound_candidate_hash
+            .clone()
+            .or_else(|| self.store.current_candidate(task_id).map(|c| c.candidate_hash));
+        let cand = bound.and_then(|h| self.store.get_candidate(task_id, &h));
         let verdict = review_verdict_from(result, state);
         let mut t = task.clone();
         if let Some(cand) = &cand {
             // candidate must still be current (G5: review binds the hash it saw)
+            let still_current = self
+                .store
+                .current_candidate(task_id)
+                .map(|c| c.candidate_hash == cand.candidate_hash)
+                .unwrap_or(false);
             let review = ReviewRecord {
                 review_id: new_id("r"),
                 task_id: task_id.to_string(),
@@ -1468,7 +1552,7 @@ failure_location: cp
                 verdict: Some(verdict.clone()),
                 summary: result.summary.clone(),
                 issues: serde_json::json!({"raw": result.summary}),
-                historical: false,
+                historical: !still_current,
                 created_at: timestamp(),
             };
             self.store.insert_review(&review).ok();
@@ -1801,6 +1885,33 @@ failure_location: cp
         if !cand.current {
             return Err(CoreError::conflict("candidate_stale", "candidate is historical; re-collect first"));
         }
+        // WP04: write_then_review acceptance requires a valid PASS review bound to
+        // this exact candidate (same revision, same generation, not historical).
+        // The direct recipe keeps manual acceptance.
+        if task.recipe == Recipe::WriteThenReview {
+            let review = self.store.latest_review_for(task_id, candidate_hash);
+            match review {
+                None => {
+                    return Err(CoreError::conflict(
+                        "review_required",
+                        "write_then_review candidates need a review of this candidate before acceptance",
+                    ));
+                }
+                Some(r) if r.historical => {
+                    return Err(CoreError::conflict(
+                        "candidate_stale",
+                        "the review for this candidate is historical; re-collect first",
+                    ));
+                }
+                Some(r) if r.verdict.as_deref() != Some("pass") => {
+                    return Err(CoreError::conflict(
+                        "review_not_passed",
+                        format!("review verdict is {:?}; only pass candidates are acceptable", r.verdict),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         let exported = worktree::export_patch(&self.store, &self.cfg.git, &task, &cand)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -1875,7 +1986,23 @@ failure_location: cp
                 continue;
             };
             if task.budget_remaining() <= 0 {
-                continue;
+                let intent = self.store.meta_get(&format!("next_step:{}", &task.task_id));
+                let paired_review = intent
+                    .as_deref()
+                    .map(|sid| {
+                        self.store
+                            .latest_plan(&task.task_id)
+                            .map(|p| {
+                                p.steps
+                                    .iter()
+                                    .any(|s| s.step_id == sid && s.role == Role::Reviewer)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !paired_review {
+                    continue;
+                }
             }
             // attempt dispatch with a synthetic scheduler request (idempotent per task+generation)
             let request_id = format!("sched:{}:{}:{}", task.task_id, task.current_generation, task.launches_used);

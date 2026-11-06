@@ -14,10 +14,11 @@ pub struct TestEnv {
     pub port: u16,
     pub token: String,
     pub csrf: String,
+    pub startup_code_value: String,
     pub core: Arc<Core>,
     pub managed_root: PathBuf,
     pub user_repo: PathBuf,
-    _guard: Option<tempdir_guard::Guard>,
+    _guard: Option<tempdir_guard::Guard>,    _lock: Option<wagglepost::instance_lock::InstanceGuard>,
 }
 
 mod tempdir_guard {
@@ -84,13 +85,19 @@ impl TestEnv {
                 let _ = axum::serve(listener, router(state)).await;
             });
         });
+        let SC = format!("code-{}", &new_token()[..8]);
+        core.store.meta_set("startup_code", &SC);
+        // the in-process server IS a real instance: hold the managed-root lock (WP06)
+        let lock = wagglepost::instance_lock::acquire(&managed).expect("instance lock");
         Arc::new(TestEnv {
             port,
             token: "test-token".into(),
             csrf: "test-csrf".into(),
+            startup_code_value: SC.clone(),
             core,
             managed_root: managed,
             user_repo,
+            _lock: Some(lock),
             _guard: Some(tempdir_guard::Guard(root)),
         })
     }
@@ -221,6 +228,41 @@ impl TestEnv {
             None,
         )
         .expect("approve");
+        (task_id, hash)
+    }
+
+    pub fn startup_code(&self) -> String {
+        self.startup_code_value.clone()
+    }
+
+    pub fn ready_task_scoped(
+        &self,
+        recipe: &str,
+        writer: Option<&str>,
+        script: Option<Value>,
+        allowed_paths: Vec<String>,
+    ) -> (String, String) {
+        let mut body = json!({
+            "goal": "append one demo line to lib.txt (offline simulated)",
+            "repo_path": self.user_repo.to_string_lossy(),
+            "recipe": recipe,
+            "allowed_adapters": ["fake"],
+            "allowed_paths": allowed_paths,
+        });
+        if let Some(w) = writer {
+            body["writer_adapter"] = json!(w);
+        }
+        let resp = self
+            .req("POST", "/v1/tasks", Some(&body), Some(&format!("sub-{}", &new_token()[..8])))
+            .expect("submit");
+        let task_id = resp["task"]["task_id"].as_str().unwrap().to_string();
+        self.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).expect("trust");
+        let plan = self.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None).expect("plan");
+        if let Some(s) = &script {
+            self.core.store.meta_set(&format!("fake_script:{}:s1", task_id), &s.to_string());
+        }
+        let hash = plan["plan"]["summary_hash"].as_str().unwrap().to_string();
+        self.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
         (task_id, hash)
     }
 

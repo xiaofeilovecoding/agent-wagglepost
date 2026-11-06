@@ -166,17 +166,38 @@ fn g5_candidate_binding_review_and_accept() {
         }),
     );
     let _ = env.run_until(&task_id, &["needs_review"], Duration::from_secs(90));
-    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
-    let cands = snap["candidates"].as_array().unwrap();
-    assert_eq!(cands.len(), 2, "A and B both recorded");
-    let cand_b = cands
-        .iter()
-        .find(|c| c["current"].as_bool() == Some(true))
-        .unwrap()["candidate_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // the reviewer re-runs for candidate B: wait for a non-historical PASS bound to B
+    let start = std::time::Instant::now();
+    let (snap, cand_b, b_pass) = loop {
+        let _ = env.req("POST", "/v1/__tick", Some(&json!({})), None);
+        let s = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+        let found = {
+            let cands = s["candidates"].as_array().unwrap();
+            match cands.iter().find(|c| c["current"].as_bool() == Some(true)) {
+                Some(cb) => {
+                    let cb_hash = cb["candidate_hash"].as_str().unwrap().to_string();
+                    s["reviews"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["candidate_hash"] == json!(cb_hash))
+                        .map(|r| (cb_hash, r.clone()))
+                }
+                None => None,
+            }
+        };
+        if let Some((cb_hash, r)) = found {
+            break (s, cb_hash, r);
+        }
+        assert!(start.elapsed() < Duration::from_secs(90), "B review never recorded");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(snap["candidates"].as_array().unwrap().len(), 2, "A and B both recorded");
     assert_ne!(cand_a, cand_b, "A and B are distinct candidates");
+    assert_eq!(b_pass["verdict"], json!("pass"), "B has its own pass review");
+    assert_eq!(b_pass["historical"], json!(false), "B's review is current");
+    assert_ne!(cand_a, cand_b, "A and B are distinct candidates");
+    let cands = snap["candidates"].as_array().unwrap();
     let cand_a_row = cands.iter().find(|c| c["candidate_hash"] == json!(cand_a)).unwrap();
     assert_eq!(cand_a_row["current"], json!(false), "A superseded by B");
     // A's review is historical once a new candidate exists
