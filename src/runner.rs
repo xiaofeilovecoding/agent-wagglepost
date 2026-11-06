@@ -576,17 +576,19 @@ pub fn launch(spec: &SpawnSpec) -> Result<RunningChild, String> {
                 read_lines(h, tx);
             });
         }
-        // stderr drain thread
+        // stderr drain thread: grab the sink handles and DROP the job lock before
+        // draining (drain runs until EOF; holding the lock would deadlock stop/wait)
         {
             let job = job_arc.clone();
             let err_h = winproc::SendHandle(spawned.err_read);
             std::thread::spawn(move || {
-                if let Some(job) = job.inner.lock().unwrap().as_ref() {
-                    let sink = job.stderr.clone();
-                    let (buf, trunc) = (&sink.0, &sink.1);
-                    winproc::drain_pipe_to(err_h, buf, trunc, STDERR_CAP);
-                } else {
-                    winproc::close_read(err_h.0);
+                let sink = {
+                    let g = job.inner.lock().unwrap();
+                    g.as_ref().map(|j| j.stderr.clone())
+                };
+                match sink {
+                    Some(s) => winproc::drain_pipe_to(err_h, &s.0, &s.1, STDERR_CAP),
+                    None => winproc::close_read(err_h.0),
                 }
             });
         }

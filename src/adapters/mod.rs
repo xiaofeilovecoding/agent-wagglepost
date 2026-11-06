@@ -22,6 +22,7 @@ pub struct DispatchContext {
     pub managed_root: std::path::PathBuf,
     pub fake_script: Option<Value>,
     pub timeout_secs: u64,
+    pub fake_exe: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]

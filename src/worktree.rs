@@ -153,7 +153,12 @@ pub fn is_clean(cfg: &GitConfig, repo: &str) -> Result<bool, String> {
         .output()
         .map_err(|e| e.to_string())?;
     let _ = (ls, head_ls);
-    Ok(diffq.status.success())
+    if !diffq.status.success() {
+        return Ok(false); // tracked changes
+    }
+    // untracked files are dirty too (they would not enter the worktree baseline)
+    let others = run_git(cfg, Path::new(repo), &["ls-files", "--others", "--exclude-standard"], None)?;
+    Ok(others.trim().is_empty())
 }
 
 /// Create an isolated worktree at managed root, detached at explicit commit.
@@ -286,6 +291,8 @@ pub fn freeze_candidate(
         .find(|w| w.generation == generation)
         .ok_or("worktree for generation not found")?;
     let p = Path::new(&wt.path);
+    // observe the delta BEFORE freezing (post-commit the tree is clean)
+    let pre = observe_worktree(cfg, &wt.path)?;
     // add all changes including untracked
     run_git(cfg, p, &["add", "-A"], None)?;
     let msg = format!("wagglepost candidate: task {} attempt {} g{}", task.task_id, attempt_id, generation);
@@ -296,8 +303,7 @@ pub fn freeze_candidate(
         None,
     )?;
     let commit = run_git(cfg, p, &["rev-parse", "HEAD"], None)?.trim().to_string();
-    let obs = observe_worktree(cfg, &wt.path)?;
-    let chash = candidate_hash(cfg, &wt.path)?;
+    let obs = pre;
     // patch export: diff base..commit
     let patch = run_git(
         cfg,
@@ -305,6 +311,16 @@ pub fn freeze_candidate(
         &["diff", "--binary", &task.base_commit, &commit],
         None,
     )?;
+    // candidate hash is bound to the actual delta content (base + patch)
+    let chash = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(b"wagglepost-candidate-v1:");
+        h.update(task.base_commit.as_bytes());
+        h.update([0u8]);
+        h.update(patch.as_bytes());
+        hex::encode(h.finalize())
+    };
     let patch_rel = format!("patches/{}.patch", &task.task_id);
     let patch_dir = cfg.managed_root.join("patches");
     std::fs::create_dir_all(&patch_dir).map_err(|e| e.to_string())?;
@@ -416,7 +432,39 @@ pub fn apply_checkpoint(
             ));
         }
     }
+    // restore checkpointed untracked files (bundle dir beside the patch);
+    // runs even when the tracked diff is empty (untracked-only checkpoints)
+    if let Some(patch_path) = &checkpoint.patch_path {
+        if let Some(pfile) = std::path::Path::new(patch_path).file_name() {
+            // patch lives at <managed>/patches/<file>; the bundle is <managed>/checkpoints/<stem>
+            let task_dir = std::path::Path::new(patch_path)
+                .parent()
+                .and_then(|p| p.parent());
+            if let Some(td) = task_dir {
+                let bundle_name = pfile.to_string_lossy().trim_end_matches(".patch").to_string();
+                let bundle = td.join("checkpoints").join(bundle_name);
+                if bundle.is_dir() {
+                    copy_dir_recursive(&bundle, std::path::Path::new(&wt.path))?;
+                }
+            }
+        }
+    }
     Ok(wt)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Export accepted patch (for the user to take away). Returns absolute path.

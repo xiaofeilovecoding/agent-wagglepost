@@ -288,7 +288,8 @@ pub struct Checkpoint {
     pub created_at: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DecisionOption {
     pub id: String,
     pub label_zh: String,
@@ -415,6 +416,7 @@ pub struct AdapterInfo {
 // ---------- structured agent result ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AgentResult {
     pub status: String, // done | needs_decision | blocked
     pub summary: Option<String>,

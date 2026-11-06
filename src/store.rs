@@ -670,7 +670,7 @@ impl Store {
     pub fn update_request(&self, r: &RequestRecord) -> Result<(), String> {
         let c = self.conn.lock().unwrap();
         c.execute(
-            "UPDATE requests SET status=?5,attempt_id=?4,result=?8,replayed=?6,updated_at=?10 WHERE request_id=?1",
+            "UPDATE requests SET kind=?2, digest=?3, task_id=?4, attempt_id=?5, status=?6, replayed=?7, result=?8, updated_at=?10 WHERE request_id=?1",
             params![
                 r.request_id, r.kind, r.digest, r.task_id, r.attempt_id, r.status,
                 r.replayed as i64, serde_json::to_string(&r.result).unwrap_or_default(),
@@ -689,6 +689,11 @@ impl Store {
             row_request as RowMapper<RequestRecord>,
         )
         .ok()
+    }
+
+    pub fn delete_request(&self, request_id: &str) {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM requests WHERE request_id=?1", params![request_id]).ok();
     }
 
     pub fn find_request_by_digest(&self, digest: &str) -> Option<RequestRecord> {

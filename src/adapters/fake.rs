@@ -37,7 +37,11 @@ impl Adapter for FakeAdapter {
             .fake_script
             .clone()
             .ok_or("fake adapter requires a script")?;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = ctx
+            .fake_exe
+            .clone()
+            .or_else(|| std::env::var("WAGGLEPOST_FAKE_EXE").ok().map(std::path::PathBuf::from))
+            .unwrap_or(std::env::current_exe().map_err(|e| e.to_string())?);
         let script_path = ctx
             .managed_root
             .join("fake-scripts")

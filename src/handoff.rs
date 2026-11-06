@@ -267,31 +267,31 @@ fn trim_body(body: &str, cap: usize) -> String {
 }
 
 fn finish(
-    text: String,
+    mut text: String,
     evidence_refs: Vec<String>,
     mode: HandoffMode,
     budget: usize,
     bytes: usize,
-    _notice: Option<String>,
+    notice: Option<String>,
 ) -> HandoffBody {
+    if let Some(n) = notice {
+        text = format!("{n}
+
+{text}");
+    }
     HandoffBody {
         sha256: sha256_hex(text.as_bytes()),
+        bytes: text.as_bytes().len().max(bytes),
         text,
-        bytes,
         evidence_refs,
         mode: mode.as_str().to_string(),
         budget_bytes: budget,
     }
 }
 
-fn zh_en(_lang: &'static str, _zh: &str, en: &str) -> String {
-    // section headers stay bilingual to keep parity across languages
-    let _ = (_lang, zh_unused());
-    en.to_string()
-}
-
-fn zh_unused() -> &'static str {
-    ""
+fn zh_en(_lang: &'static str, zh: &str, _en: &str) -> String {
+    // section headers are bilingual in the source strings; keep parity across languages
+    zh.to_string()
 }
 
 /// Buildable parts; empty strings are skipped.

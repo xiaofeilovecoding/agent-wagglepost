@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod core;
 pub mod events;
+pub mod fake_agent;
 pub mod handoff;
 pub mod http;
 pub mod ids;

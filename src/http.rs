@@ -55,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/messages", get(list_messages))
         .route("/v1/events", get(sse_events))
         .route("/v1/resume-options/{id}", get(resume_options))
+        .route("/v1/__tick", post(tick))
         .with_state(state)
 }
 
@@ -99,15 +100,14 @@ async fn guard(
                 if o != expected && o != expected2 {
                     return Err(error_response(StatusCode::FORBIDDEN, "bad_origin", "Origin is not the loopback server"));
                 }
-                // cookie-session callers must carry the CSRF token
-                if cookie_session_ok && !bearer_ok {
-                    let csrf = headers
-                        .get("x-csrf-token")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    if csrf != state.csrf_token {
-                        return Err(error_response(StatusCode::FORBIDDEN, "csrf", "missing or wrong CSRF token"));
-                    }
+                // browser-like callers (Origin present) must carry the CSRF token that only
+                // an authenticated session could obtain; wrong/absent → reject
+                let csrf = headers
+                    .get("x-csrf-token")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if csrf != state.csrf_token {
+                    return Err(error_response(StatusCode::FORBIDDEN, "csrf", "browser-session mutations need the CSRF token"));
                 }
             }
             None => {
@@ -692,7 +692,7 @@ async fn handoff_preview(
     let Some(step) = plan.steps.iter().find(|s| s.role == role) else {
         return error_response(StatusCode::NOT_FOUND, "not_found", "no such step");
     };
-    let generation = task.current_generation.max(1);
+    let generation = task.current_generation + 1;
     match state.core.assemble_handoff(&task, step, generation) {
         Ok(h) => Json(json!({
             "handoff": {
@@ -763,6 +763,15 @@ async fn resume_options(
         },
     }))
     .into_response()
+}
+
+async fn tick(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let (bearer, cookie) = auth_context(&state, &headers);
+    if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
+        return r;
+    }
+    state.core.scheduler_tick();
+    Json(json!({"ticked": true})).into_response()
 }
 
 async fn get_request(State(state): State<SharedState>, Path(id): Path<String>, headers: HeaderMap) -> Response {

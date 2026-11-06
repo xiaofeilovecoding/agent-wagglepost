@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 pub struct CoreConfig {
     pub git: GitConfig,
+    /// executable used to spawn the fake agent (tests pin this to the test binary host)
+    pub fake_exe: Option<PathBuf>,
     pub codex_exe: PathBuf,
     pub claude_exe: PathBuf,
     pub codex_version: Option<String>,
@@ -32,11 +34,12 @@ impl CoreConfig {
         let codex_exe = discover_codex();
         let codex_version = codex_exe
             .as_ref()
-            .and_then(|p| probe_version(p, &[]));
+            .and_then(|p| probe_version(p, &["exec", "--version"]));
         let claude_exe = discover_claude();
         let claude_version = claude_exe.as_ref().and_then(|p| probe_version(p, &["--version"]));
         CoreConfig {
             git: GitConfig::default(),
+            fake_exe: None,
             codex_exe: codex_exe.unwrap_or_default(),
             claude_exe: claude_exe.unwrap_or_default(),
             codex_version,
@@ -608,18 +611,31 @@ impl Core {
             .filter(|a| a.status == AttemptStatus::Completed)
             .map(|a| a.step_id.as_str())
             .collect();
-        let next_step = plan
-            .steps
-            .iter()
-            .find(|s| {
-                !done_steps.contains(&s.step_id.as_str())
-                    && s.depends_on.iter().all(|d| done_steps.contains(&d.as_str()))
-                    && !attempts
-                        .iter()
-                        .any(|a| a.step_id == s.step_id && a.status.live())
+        // explicit relay/resume intent (set by reroute/answer) names the step to re-run;
+        // otherwise pick the first fresh step (never attempted, deps done)
+        let next_step_id = self.store.meta_get(&format!("next_step:{}", task_id));
+        let next_step = match next_step_id {
+            Some(sid) if !sid.is_empty() => {
+                self.store.meta_set(&format!("next_step:{}", task_id), "");
+                plan.steps.iter().find(|s| s.step_id == sid).cloned()
+            }
+            _ => plan
+                .steps
+                .iter()
+                .find(|s| {
+                    !attempts.iter().any(|a| a.step_id == s.step_id)
+                        && s.depends_on.iter().all(|d| done_steps.contains(&d.as_str()))
+                })
+                .cloned(),
+        }
+        .filter(|s| {
+            // even an intent-named step cannot run twice in the same generation
+            let generation = task.current_generation + 1;
+            !attempts.iter().any(|a| {
+                a.step_id == s.step_id && (a.status.live() || a.generation >= generation)
             })
-            .cloned()
-            .ok_or_else(|| {
+        })
+        .ok_or_else(|| {
                 if attempts.iter().any(|a| a.status.live()) {
                     CoreError::busy("slot_busy", "an attempt is already running")
                 } else {
@@ -660,10 +676,6 @@ impl Core {
 
         // assemble handoff (local, deterministic)
         let generation = task.current_generation + 1;
-        let resume_mode = next_step.role == Role::Writer
-            && attempts.iter().any(|a| a.generation == generation && a.generation > 1)
-            && false; // resume on dispatch only for decision-resume, handled separately
-        let _ = resume_mode;
         let handoff = self.assemble_handoff(&task, &next_step, generation)?;
         let body_digest = sha256_hex(handoff.text.as_bytes());
         if handoff.bytes > handoff.budget_bytes {
@@ -753,6 +765,7 @@ impl Core {
             managed_root: self.cfg.managed_root.clone(),
             fake_script: self.fake_script_for(&task, &next_step, generation),
             timeout_secs: task.timeout_secs,
+            fake_exe: self.cfg.fake_exe.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flags
@@ -786,13 +799,19 @@ impl Core {
         }
         // default fake script: writer writes a small file, reviewer passes.
         // tests can override via meta key fake_script:<task_id>:<step>
-        if let Some(s) = self.store.meta_get(&format!("fake_script:{}:{}", task.task_id, step.step_id)) {
-            return serde_json::from_str(&s).ok();
+        let script_key = format!("fake_script:{}:{}", task.task_id, step.step_id);
+        if let Some(s) = self.store.meta_get(&script_key) {
+            if !s.is_empty() {
+                // one-shot: tests pin a script per run; consumed on use so later
+                // generations fall back to the default scripted behavior
+                self.store.meta_set(&script_key, "");
+                return serde_json::from_str(&s).ok();
+            }
         }
         if step.role == Role::Reviewer {
             Some(json!({
                 "behaviors": ["review"],
-                "result": {"status": "done", "summary": "复核完成：候选与检查证据一致（模拟）"},
+                "result": {"status": "done", "summary": "复核完成 pass：候选与检查证据一致（模拟）"},
                 "review": {"verdict": "pass"}
             }))
         } else if generation > 1 {
@@ -862,17 +881,37 @@ impl Core {
                             cp.as_ref().map(|c| c.checkpoint_id.clone()).unwrap_or_default(),
                             cp.as_ref().map(|c| c.candidate_hash.clone()).unwrap_or_default(),
                         ),
-                        confirmed_progress: cp
-                            .as_ref()
-                            .map(|c| {
-                                format!(
-                                    "上一写者已保存的改动文件：{}\n未跟踪文件：{}",
-                                    c.changed_files.join(", "),
-                                    c.untracked_files.join(", ")
-                                )
-                            })
-                            .or(Some("无已确认进度 / none".into())),
-                        failure_location: cp
+                        confirmed_progress: Some({
+                            let base = cp
+                                .as_ref()
+                                .map(|c| {
+                                    format!(
+                                        "上一写者已保存的改动文件：{}
+未跟踪文件：{}",
+                                        c.changed_files.join(", "),
+                                        c.untracked_files.join(", ")
+                                    )
+                                })
+                                .unwrap_or_else(|| "无已确认进度 / none".into());
+                            let answered = self
+                                .store
+                                .list_decisions(false)
+                                .into_iter()
+                                .filter(|d| d.task_id == task.task_id && d.status == "answered")
+                                .max_by_key(|d| d.created_at.clone());
+                            match answered {
+                                Some(d) => format!(
+                                    "{}
+用户已回答决策卡 {}：选择 {}（问题：{}）",
+                                    base,
+                                    d.decision_id,
+                                    d.resolution.clone().unwrap_or_default(),
+                                    d.question
+                                ),
+                                None => base,
+                            }
+                        }),
+failure_location: cp
                             .as_ref()
                             .and_then(|c| c.failure_summary.clone())
                             .or(Some("失败位置见检查点 / see checkpoint".into())),
@@ -1075,6 +1114,26 @@ impl Core {
         if attempt.native_id.is_none() {
             attempt.native_id = res.state.native_id.clone();
         }
+        // a requested cancel ends as cancelled regardless of the agent's last words
+        if attempt.status == AttemptStatus::Stopping || res.exit.killed {
+            attempt.status = AttemptStatus::Cancelled;
+            let _ = self.store.update_attempt(&attempt);
+            self.save_checkpoint(task_id, attempt_id, Some("cancelled by user; changes kept"), CheckpointSource::LocalObserved);
+            if let Some(mut t) = self.store.get_task(task_id) {
+                t.status = TaskStatus::Cancelled;
+                t.updated_at = timestamp();
+                let _ = self.store.update_task(&t);
+            }
+            self.cancel_flags.lock().unwrap().remove(attempt_id);
+            self.bus.emit(
+                Some(task_id),
+                Some(attempt_id),
+                attempt.generation,
+                "attempt_cancelled",
+                json!({"stop_confirmed": res.exit.stop_confirmed}),
+            );
+            return;
+        }
         attempt.status = AttemptStatus::Completed;
         let _ = self.store.update_attempt(&attempt);
 
@@ -1239,6 +1298,8 @@ impl Core {
                     // freeze candidate then chain the reviewer
                     match wt.as_ref().map(|w| worktree::freeze_candidate(&self.store, &self.cfg.git, &t, attempt_id, t.current_generation)) {
                         Some(Ok(_cand)) => {
+                            // a new candidate supersedes old-candidate reviews (kept as history)
+                            self.store.mark_reviews_historical(task_id);
                             t.status = TaskStatus::NeedsReview;
                             t.updated_at = timestamp();
                             let _ = self.store.update_task(&t);
@@ -1360,17 +1421,52 @@ impl Core {
         source: CheckpointSource,
     ) -> Option<Checkpoint> {
         let task = self.store.get_task(task_id)?;
+        // the writer attempt's own worktree carries the work (review generations 1000+ don't)
         let wt = self
             .store
-            .list_task_worktrees(task_id)
-            .into_iter()
-            .find(|w| w.generation == task.current_generation)?;
+            .get_attempt(attempt_id)
+            .and_then(|a| a.worktree_id)
+            .and_then(|wid| self.store.get_worktree(&wid));
+        let wt = match wt {
+            Some(w) => w,
+            None => self
+                .store
+                .list_task_worktrees(task_id)
+                .into_iter()
+                .find(|w| w.generation == task.current_generation)?,
+        };
         let obs = worktree::observe_worktree(&self.cfg.git, &wt.path).ok()?;
         let chash = worktree::candidate_hash(&self.cfg.git, &wt.path).ok()?;
+        // patch = committed diff vs base + uncommitted diff (frozen candidates diff base..HEAD)
+        let committed = worktree::run_git(
+            &self.cfg.git,
+            std::path::Path::new(&wt.path),
+            &["diff", "--binary", &task.base_commit, "HEAD"],
+            None,
+        )
+        .unwrap_or_default();
+        let patch_text = format!("{committed}{}", obs.diff_text);
         let patch_rel = format!("patches/{}.g{}.checkpoint.patch", task_id, task.current_generation);
         let patch_path = self.cfg.managed_root.join(&patch_rel);
         let _ = std::fs::create_dir_all(patch_path.parent().unwrap());
-        let _ = std::fs::write(&patch_path, &obs.diff_text);
+        let _ = std::fs::write(&patch_path, &patch_text);
+        // untracked file contents are checkpointed into a bundle (diffs cannot carry them)
+        let bundle_dir = self
+            .cfg
+            .managed_root
+            .join("checkpoints")
+            .join(format!("{}.g{}.checkpoint", task_id, task.current_generation));
+        if !obs.untracked_files.is_empty() {
+            let _ = std::fs::create_dir_all(&bundle_dir);
+            for f in &obs.untracked_files {
+                let src = std::path::Path::new(&wt.path).join(f);
+                let dst = bundle_dir.join(f);
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
         let cp = Checkpoint {
             checkpoint_id: new_id("cp"),
             task_id: task_id.to_string(),
@@ -1478,6 +1574,12 @@ impl Core {
         self.store.update_decision(&d2)?;
         self.store.resolve_message_by_task(&d.task_id, "decision_opened");
         // queue resume: task back to queued; scheduler dispatches when slot free
+        let writer_step = self
+            .store
+            .latest_plan(&d.task_id)
+            .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).map(|s| s.step_id.clone()))
+            .unwrap_or_else(|| "s1".into());
+        self.store.meta_set(&format!("next_step:{}", d.task_id), &writer_step);
         task.status = TaskStatus::Queued;
         task.resume_used += 1;
         task.updated_at = timestamp();
@@ -1504,21 +1606,41 @@ impl Core {
             .store
             .get_task(task_id)
             .ok_or_else(|| CoreError::not_found("task not found"))?;
-        // reroute eligible only from stopped states with confirmed old writer exit + checkpoint
+        // reroute eligible from stopped states with confirmed old writer exit + checkpoint,
+        // or from needs_review when the current candidate's review found issues (manual reroute)
+        let review_failed = task.status == TaskStatus::NeedsReview
+            && self
+                .store
+                .current_candidate(task_id)
+                .and_then(|c| self.store.latest_review_for(task_id, &c.candidate_hash))
+                .map(|r| r.verdict.as_deref() == Some("issues"))
+                .unwrap_or(false);
         let eligible = matches!(
             task.status,
             TaskStatus::Interrupted | TaskStatus::QuotaBlocked | TaskStatus::AuthRequired | TaskStatus::Cancelled
-        );
+        ) || review_failed;
         if !eligible {
             return Err(CoreError::conflict(
                 "reroute_not_eligible",
-                "reroute needs a confirmed-stopped writer and saved checkpoint",
+                "reroute needs a confirmed-stopped writer and saved checkpoint (or a failed review)",
             ));
         }
-        let cp = self
-            .store
-            .latest_checkpoint(task_id)
-            .ok_or_else(|| CoreError::conflict("checkpoint_missing", "no checkpoint to relay"))?;
+        let cp = match self.store.latest_checkpoint(task_id) {
+            Some(cp) => Some(cp),
+            None => {
+                if review_failed {
+                    let writer_attempt = self
+                        .store
+                        .current_candidate(task_id)
+                        .map(|c| c.attempt_id)
+                        .unwrap_or_default();
+                    self.save_checkpoint(task_id, &writer_attempt, Some("review found issues; manual reroute"), CheckpointSource::LocalObserved)
+                } else {
+                    None
+                }
+            }
+        }
+        .ok_or_else(|| CoreError::conflict("checkpoint_missing", "no checkpoint to relay"))?;
         // old writer stop evidence: last writer attempt must not be live
         let old_writer_live = self
             .store
@@ -1550,10 +1672,15 @@ impl Core {
         if !live.is_empty() {
             return Err(CoreError::busy("no_free_slot", "execution slot is busy"));
         }
-        // queue the relay: scheduler will dispatch generation+1 from checkpoint
+        // queue the relay: the scheduler dispatches generation+1 from the checkpoint
+        let writer_step = self
+            .store
+            .latest_plan(task_id)
+            .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).map(|s| s.step_id.clone()))
+            .unwrap_or_else(|| "s1".into());
+        self.store.meta_set(&format!("next_step:{}", task_id), &writer_step);
         let mut t = task;
         t.status = TaskStatus::Queued;
-        t.current_generation += 1; // pre-claim the next generation for the relay attempt
         t.resume_used += 1;
         t.updated_at = timestamp();
         self.store.update_task(&t)?;
@@ -1561,9 +1688,9 @@ impl Core {
         self.bus.emit(
             Some(task_id),
             Some(&request.request_id),
-            t.current_generation,
+            t.current_generation + 1,
             "reroute_started",
-            json!({"target": target_adapter, "checkpoint": cp.checkpoint_id, "generation": t.current_generation}),
+            json!({"target": target_adapter, "checkpoint": cp.checkpoint_id, "generation": t.current_generation + 1}),
         );
         Ok(t)
     }
@@ -1655,7 +1782,7 @@ impl Core {
             return;
         }
         for task in self.store.list_tasks() {
-            if task.status != TaskStatus::Queued {
+            if task.status != TaskStatus::Queued && task.status != TaskStatus::NeedsReview {
                 continue;
             }
             let Some(plan) = self
@@ -1684,12 +1811,11 @@ impl Core {
                     self.finish_request(req, json!({"scheduled": true, "task_id": task.task_id}), aid);
                     return; // one per tick
                 }
-                Err(e) => {
-                    // busy → try later; other errors leave the task in place with an event
-                    if e.status == 429 {
-                        continue;
-                    }
-                    self.fail_request(req, json!({"scheduled": false, "error": e.message}));
+                Err(_) => {
+                    // busy / no runnable step / transient gate → drop the synthetic
+                    // request so a later tick retries when state changes
+                    self.store.delete_request(&request_id);
+                    continue;
                 }
             }
         }
