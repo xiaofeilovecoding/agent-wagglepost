@@ -26,6 +26,9 @@ pub struct CoreConfig {
     pub dsh: adapters::dsh::DshAdapter,
     pub managed_root: PathBuf,
     pub default_body_budget: usize,
+    /// Refuse new launches below this managed-root free-space floor (10 GiB default).
+    pub min_free_bytes: u64,
+    pub log_retention_days: u64,
 }
 
 impl CoreConfig {
@@ -46,6 +49,14 @@ impl CoreConfig {
             dsh: adapters::dsh::probe(),
             managed_root: worktree::default_managed_root(),
             default_body_budget: handoff::DEFAULT_BODY_BUDGET,
+            min_free_bytes: std::env::var("WAGGLEPOST_MIN_FREE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10 * 1024 * 1024 * 1024),
+            log_retention_days: std::env::var("WAGGLEPOST_LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7),
         }
     }
 }
@@ -57,11 +68,7 @@ fn discover_codex() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let p = PathBuf::from(r"C:\Users\ExampleUser\.codex\plugins\.plugin-appserver\codex.exe");
-    if p.is_file() {
-        return Some(p);
-    }
-    None
+    crate::worktree::find_in_path("codex")
 }
 
 fn discover_claude() -> Option<PathBuf> {
@@ -71,16 +78,7 @@ fn discover_claude() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // npm shim dir → real native binary
-    let candidates = [
-        PathBuf::from(r"D:\dev\nvm\installs\v24.15.0\node_modules\@anthropic-ai\claude-code\bin\claude.exe"),
-    ];
-    for c in candidates {
-        if c.is_file() {
-            return Some(c);
-        }
-    }
-    None
+    crate::worktree::find_in_path("claude")
 }
 
 fn probe_version(exe: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -101,6 +99,27 @@ fn probe_version(exe: &std::path::Path, args: &[&str]) -> Option<String> {
     } else {
         Some(v)
     }
+}
+
+#[cfg(windows)]
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    if ok != 0 {
+        Some(available)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 pub struct Core {
@@ -256,6 +275,61 @@ Sample repository for the offline wagglepost tour.
 
     // ================= doctor =================
 
+    /// Remove attempt log files older than the retention window. Candidates and
+    /// patches are never touched.
+    pub fn cleanup_old_logs(&self) -> usize {
+        let dir = self.cfg.managed_root.join("logs");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(self.cfg.log_retention_days * 86_400))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mut removed = 0;
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|x| x.to_str()) != Some("log") {
+                continue;
+            }
+            let old = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|m| m < cutoff)
+                .unwrap_or(false);
+            if old && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub fn logs_usage(&self) -> Value {
+        let dir = self.cfg.managed_root.join("logs");
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                if let Ok(md) = e.metadata() {
+                    if md.is_file() {
+                        files += 1;
+                        bytes += md.len();
+                    }
+                }
+            }
+        }
+        json!({
+            "dir": dir.to_string_lossy(),
+            "files": files,
+            "bytes": bytes,
+            "retention_days": self.cfg.log_retention_days,
+            "stderr_cap_bytes": crate::runner::STDERR_CAP,
+        })
+    }
+
     pub fn doctor(&self) -> Value {
         let _codex_ok = self.cfg.codex_exe.is_file();
         let _claude_ok = self.cfg.claude_exe.is_file();
@@ -274,6 +348,9 @@ Sample repository for the offline wagglepost tour.
             "git": {"exe": self.cfg.git.git_exe.to_string_lossy(), "version": git_version},
             "managed_root": self.cfg.managed_root.to_string_lossy(),
             "managed_root_ok": managed_ok,
+            "min_free_bytes": self.cfg.min_free_bytes,
+            "free_bytes": free_bytes(&self.cfg.managed_root),
+            "logs": self.logs_usage(),
             "platform": std::env::consts::OS,
         })
     }
@@ -1080,6 +1157,19 @@ Sample repository for the offline wagglepost tour.
             }
         }
 
+        // WP12: cheap disk precheck before creating a worktree. Keep the queue,
+        // task and budget untouched when the managed root is below the reserve.
+        if let Some(free) = free_bytes(&self.cfg.managed_root) {
+            if free < self.cfg.min_free_bytes {
+                return Err(CoreError::conflict(
+                    "disk_low",
+                    format!(
+                        "managed root has {} free bytes, below the configured {} byte reserve; free space or change WAGGLEPOST_MANAGED_ROOT",
+                        free, self.cfg.min_free_bytes
+                    ),
+                ));
+            }
+        }
         // create worktree BEFORE starting (workspace ownership persisted first)
         let wt = if next_step.role == Role::Reviewer {
             let cand = self

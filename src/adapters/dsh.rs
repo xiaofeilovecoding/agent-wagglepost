@@ -49,10 +49,12 @@ impl Adapter for DshAdapter {
 
 /// Locate the DSH CLI on this machine and report its headless capability.
 pub fn probe() -> DshAdapter {
-    let candidates = [
-        PathBuf::from(r"D:\software\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"),
-        PathBuf::from("dsh"),
-    ];
+    let candidates: Vec<PathBuf> = std::env::var("WAGGLEPOST_DSH_EXE")
+        .ok()
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(crate::worktree::find_in_path("dsh"))
+        .collect();
     for c in candidates {
         if c.is_file() {
             match run_version(&c) {
@@ -65,8 +67,21 @@ pub fn probe() -> DshAdapter {
 }
 
 fn run_version(exe: &PathBuf) -> Result<String, String> {
-    let out = std::process::Command::new("cmd.exe")
-        .args(["/c", &exe.to_string_lossy(), "--version"])
+    let is_script = exe
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false);
+    let mut cmd = if cfg!(windows) && is_script {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.args(["/c", &exe.to_string_lossy(), "--version"]);
+        c
+    } else {
+        let mut c = std::process::Command::new(exe);
+        c.arg("--version");
+        c
+    };
+    let out = cmd
         .env_clear()
         .envs(crate::runner::filter_env(&[]))
         .output()

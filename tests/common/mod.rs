@@ -13,6 +13,7 @@ use wagglepost::store::Store;
 pub struct TestEnv {
     pub port: u16,
     pub token: String,
+    pub browser_token: String,
     pub csrf: String,
     pub startup_code_value: String,
     pub core: Arc<Core>,
@@ -34,7 +35,7 @@ mod tempdir_guard {
 fn unique_root() -> PathBuf {
     let base = std::env::var("WAGGLEPOST_TEST_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("D:\\dev\\wagglepost-test-data"));
+        .unwrap_or_else(|_| std::env::temp_dir().join("wagglepost-tests"));
     let dir = base.join(format!("it-{}", &new_token()[..12]));
     std::fs::create_dir_all(&dir).expect("create test root");
     dir
@@ -48,9 +49,37 @@ impl TestEnv {
     /// Variant with direct CoreConfig overrides (e.g. the offline codex version
     /// stub used by the WP14 two-fixture reroute test).
     pub fn new_with_cfg(f: impl FnOnce(&mut CoreConfig)) -> Arc<TestEnv> {
+        Self::new_with_cfg_repos(f, Vec::new())
+    }
+
+    /// CLI repository-scope test fixture: the browser token stays separate.
+    pub fn new_with_cli_repos(repos: Vec<String>) -> Arc<TestEnv> {
+        Self::new_with_cfg_repos(|_| {}, repos)
+    }
+
+    /// Scope the CLI channel to this fixture's user repository.
+    pub fn new_with_cli_scope() -> Arc<TestEnv> {
+        Self::new_inner(|_| {}, Vec::new(), true)
+    }
+
+    pub fn new_with_cfg_repos(
+        f: impl FnOnce(&mut CoreConfig),
+        cli_allowed_repos: Vec<String>,
+    ) -> Arc<TestEnv> {
+        Self::new_inner(f, cli_allowed_repos, false)
+    }
+
+    fn new_inner(
+        f: impl FnOnce(&mut CoreConfig),
+        mut cli_allowed_repos: Vec<String>,
+        scope_to_user_repo: bool,
+    ) -> Arc<TestEnv> {
         let root = unique_root();
         let managed = root.join("managed");
         let user_repo = root.join("user-repo");
+        if scope_to_user_repo {
+            cli_allowed_repos.push(user_repo.to_string_lossy().to_string());
+        }
         std::fs::create_dir_all(&user_repo).unwrap();
         git(&user_repo, &["init", "-q", "-b", "main"]);
         std::fs::write(user_repo.join("lib.txt"), "baseline content\n").unwrap();
@@ -67,6 +96,8 @@ impl TestEnv {
         cfg.managed_root = managed.clone();
         cfg.git.managed_root = managed.clone();
         cfg.fake_exe = Some(PathBuf::from(env!("CARGO_BIN_EXE_wagglepost")));
+        // tests are independent of the host disk reserve; the disk_low case opts in
+        cfg.min_free_bytes = 0;
         f(&mut cfg);
         let core = Core::new(store, cfg);
         let core2 = core.clone();
@@ -85,7 +116,9 @@ impl TestEnv {
                 let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let state = Arc::new(AppState {
                     core: core2,
-                    session_token: "test-token".into(),
+                    session_token: "test-browser-token".into(),
+                    cli_token: "test-token".into(),
+                    cli_allowed_repos: cli_allowed_repos.clone(),
                     csrf_token: "test-csrf".into(),
                     port,
                 });
@@ -103,6 +136,7 @@ impl TestEnv {
         Arc::new(TestEnv {
             port,
             token: "test-token".into(),
+            browser_token: "test-browser-token".into(),
             csrf: "test-csrf".into(),
             startup_code_value: startup_code.clone(),
             core,
@@ -496,7 +530,8 @@ fn ureq_request(method: &str, url: &str) -> ureq::Request {
 }
 
 pub fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("D:\\dev\\Git\\cmd\\git.exe")
+    let git_exe = wagglepost::worktree::find_in_path("git").unwrap_or_else(|| PathBuf::from("git"));
+    let out = std::process::Command::new(git_exe)
         .args(args)
         .current_dir(cwd)
         .output()

@@ -42,7 +42,7 @@ fn print_usage() {
         "wagglepost 0.1 — 蜂递：本地多 Agent 路由 / local multi-agent router\n\
          \n\
          USAGE:\n\
-           wagglepost serve [--port N] [--managed-root DIR]     start the loopback server + web UI\n\
+           wagglepost serve [--port N] [--managed-root DIR] [--cli-repo DIR]...\n\
            wagglepost doctor [--json]                            runtime capability check\n\
            wagglepost submit --file draft.json --json            submit a task draft\n\
            wagglepost status <task_id> --json                    task snapshot\n\
@@ -82,6 +82,35 @@ fn cmd_serve(args: Vec<String>) -> i32 {
     if let Some(root) = flag_value(&args, "--managed-root") {
         std::env::set_var("WAGGLEPOST_MANAGED_ROOT", root);
     }
+    // CLI write scope. `--cli-repo DIR` may be repeated; the environment form is
+    // a path-list separated by ';'. An empty list keeps the legacy local CLI
+    // unrestricted, but the two tokens are always distinct.
+    let mut cli_allowed_repos: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--cli-repo" {
+            if let Some(v) = args.get(i + 1) {
+                cli_allowed_repos.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = args[i].strip_prefix("--cli-repo=") {
+            cli_allowed_repos.push(v.to_string());
+        }
+        i += 1;
+    }
+    if let Ok(env_repos) = std::env::var("WAGGLEPOST_CLI_ALLOWED_REPOS") {
+        cli_allowed_repos.extend(
+            env_repos
+                .split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+        );
+    }
+    cli_allowed_repos.sort();
+    cli_allowed_repos.dedup();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -108,6 +137,10 @@ fn cmd_serve(args: Vec<String>) -> i32 {
         };
         let cfg = CoreConfig::probe();
         let core = Core::new(store, cfg);
+        let removed_logs = core.cleanup_old_logs();
+        if removed_logs > 0 {
+            eprintln!("[logs] removed {removed_logs} expired attempt log(s)");
+        }
         let notes = core.recover();
         for n in notes {
             eprintln!("[recover] {n}");
@@ -122,17 +155,26 @@ fn cmd_serve(args: Vec<String>) -> i32 {
             }
         };
         let session_token = new_token();
+        let cli_token = new_token();
         let csrf = new_token();
         let startup_code = wagglepost::ids::new_token()[..8].to_string();
         core.store.meta_set("startup_code", &startup_code);
         let cli_file = managed_root.join("cli-session.json");
         let _ = std::fs::write(
             &cli_file,
-            json!({"port": port, "token": session_token, "csrf": csrf}).to_string(),
+            json!({
+                "port": port,
+                "token": cli_token,
+                "csrf": csrf,
+                "allowed_repos": cli_allowed_repos.clone(),
+            })
+            .to_string(),
         );
         let state = Arc::new(AppState {
             core: core.clone(),
             session_token,
+            cli_token,
+            cli_allowed_repos: cli_allowed_repos.clone(),
             csrf_token: csrf,
             port,
         });
@@ -195,6 +237,19 @@ fn cmd_doctor(args: Vec<String>) -> i32 {
             doc["managed_root"].as_str().unwrap_or("-"),
             if doc["managed_root_ok"].as_bool().unwrap_or(false) { "OK" } else { "FAIL" }
         );
+        println!(
+            "  logs     {} files / {} bytes / retention {}d",
+            doc["logs"]["files"].as_u64().unwrap_or(0),
+            doc["logs"]["bytes"].as_u64().unwrap_or(0),
+            doc["logs"]["retention_days"].as_u64().unwrap_or(0)
+        );
+        if let Some(free) = doc["free_bytes"].as_u64() {
+            println!(
+                "  disk     {} free / {} reserve",
+                free,
+                doc["min_free_bytes"].as_u64().unwrap_or(0)
+            );
+        }
     }
     0
 }

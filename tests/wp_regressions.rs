@@ -28,15 +28,23 @@ fn wp01_anonymous_and_wrong_cookie_rejected() {
         "GET",
         &format!("/v1/tasks/{task_id}"),
         None,
-        &[("Cookie", &format!("xwp_session={}", env.token))],
+        &[("Cookie", &format!("xwp_session={}", env.browser_token))],
     );
     assert!(r.is_err(), "wrong cookie name must not authenticate");
-    // right cookie name authenticates
+    // the CLI bearer token must not become a browser cookie
     let r = env.raw(
         "GET",
         &format!("/v1/tasks/{task_id}"),
         None,
         &[("Cookie", &format!("wp_session={}", env.token))],
+    );
+    assert!(r.is_err(), "CLI token must not authenticate as a browser session");
+    // right cookie name authenticates
+    let r = env.raw(
+        "GET",
+        &format!("/v1/tasks/{task_id}"),
+        None,
+        &[("Cookie", &format!("wp_session={}", env.browser_token))],
     );
     assert!(r.is_ok(), "exact session cookie must authenticate: {:?}", r.err().map(|e| e.1.to_string()));
     // SSE requires auth

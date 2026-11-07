@@ -1,77 +1,99 @@
 # WagglePost
 
-**Switch agents without losing the task.** A local multi-agent router: one entry point dispatches work, a writer delivers a verifiable candidate, a second agent reviews the exact same version read-only, and after an interruption work resumes from the verified checkpoint.
+**Switch agents without losing the task.** A local multi-agent router: one entry point dispatches work, a writer delivers a verifiable candidate, a second agent reviews that exact version read-only, and an interrupted task continues from a confirmed checkpoint.
 
-WagglePost 0.1 ships as a single local binary: Rust core + SQLite + an embedded React web workbench on `127.0.0.1` + a CLI in the same binary. Routing and handoff assembly run on local rules with zero extra model calls.
+WagglePost 0.1 is a single local binary: Rust core + SQLite + an embedded React workbench on `127.0.0.1` + a CLI in the same binary. Routing and handoff assembly use deterministic local rules and make no extra planning-model calls.
 
-## What it proves
-
-- **Traceable route receipts** — before dispatch you see candidates, rejection reasons (stable `reason_code`, bilingual), permissions, budget, and who receives each step; after a run, output links back to the attempt, the managed worktree, and the input version.
-- **Verifiable checkpoint reroute** — after quota loss, cancellation, or a lost writer, WagglePost first confirms the old writer's process tree has exited, keeps the changes as a checkpoint, and continues with a new agent only after explicit approval. A real cross-tool writer handoff requires the second adapter to pass the write-capability gate on its own; until then the blocker is shown honestly and the patch stays exportable.
-- **Output feeds the next step** — the reviewer starts from the frozen candidate hash, key changes, and evidence references instead of re-reading the conversation. Role-specific handoff bodies are bounded to 8 KiB by default and approval binds the body digest (sha256).
-- **One writer per repository / one execution slot** — a single global slot; every real launch counts (failures included), and restarting, switching agents, or duplicate answers never restore spent budget.
-- **Process ownership** — a Windows Job Object contains the agent before its first instruction (CREATE_SUSPENDED → Assign → Resume); a stop counts only when the job handle confirms exit. Environment variables are allowlisted, so credentials never reach agents.
-
-## Quick start
+## Quick start (Windows 10/11 x64)
 
 ```powershell
-cargo build
-.\target\debug\wagglepost.exe serve            # default 127.0.0.1:8742
-# the console prints a one-time startup code; enter it in the browser
+git clone <this-repository> agent-wagglepost
+cd agent-wagglepost\web
+npm ci
+npm run build
+cd ..
+cargo build --locked --release
+
+.\target\release\wagglepost.exe serve --managed-root $env:TEMP\wagglepost-demo
+# the console prints a one-time startup code; open http://127.0.0.1:8742
 ```
 
-Web workbench: submit a task → review the route and reasons → approve dispatch → the writer works in an isolated worktree → a second agent reviews the same frozen candidate → inspect the diff and accept by version (patch export; the user repository is never modified).
+Without `--managed-root`, the default is `%LOCALAPPDATA%\WagglePost`; `WAGGLEPOST_MANAGED_ROOT` also works. The CLI reads `cli-session.json` from the same managed root.
 
-CLI (same receipt contract as the web):
+## What it does
+
+- Submit → plan/route receipt → approve the exact body and revision → isolated worktree writer run → frozen candidate → read-only review by a second runtime → version-bound accept or patch export.
+- Reroute binds target runtime, version, checkpoint, body digest and budget; departure/reroute events are published only after a real `agent_started` handshake.
+- One writer per repository and one global execution slot; failed launches still count against budget; repeated requests replay by idempotency key.
+- Agent output is redacted before events, inbox, result and stderr log persistence. User code, patches and diffs are not rewritten.
+
+## CLI
 
 ```text
-wagglepost doctor [--json]                    # runtime capability check
-wagglepost submit --file draft.json --json    # submit a draft (awaiting approval)
-wagglepost status <task_id> --json            # task snapshot (receipt + timeline)
-wagglepost inbox --after <seq> --json         # inbox (needs attention / collected)
-wagglepost request show <request_id> --json   # request reconciliation by original ID
-wagglepost answer <decision_id> <option_id>          # preview the relay body (nothing sent)
-wagglepost answer <decision_id> <option_id> --digest <sha256>   # confirm with the reviewed digest (queues)
-wagglepost why <task_id> --json               # route reasons + events
+wagglepost serve [--port N] [--managed-root DIR] [--cli-repo DIR]...
+wagglepost doctor [--json]
+wagglepost submit --file draft.json --json
+wagglepost status <task_id> --json
+wagglepost request show <request_id> --json
+wagglepost approve <task_id> <plan_hash> [--json]
+wagglepost approve <task_id> <plan_hash> --digest <sha256>
+wagglepost answer <decision_id> <option_id> [--json]
+wagglepost answer <decision_id> <option_id> --digest <sha256>
+wagglepost dispatch <task_id> --json
+wagglepost cancel <attempt_id> --json
 ```
 
-## Runtimes
+`--cli-repo` is repeatable and limits the CLI to authorized repositories. The browser session has its own token and is not restricted by the CLI repo list. The two channels do not share credentials.
 
-| Runtime | Role in 0.1 | Verified on this machine |
-| --- | --- | --- |
-| Codex CLI | Writer (`exec --json --sandbox workspace-write`) and optional read-only | `0.166.0-alpha.5.1` — JSONL events, usage, resume |
-| Claude Code | Read-only reviewer (`--print --output-format stream-json`, tools narrowed to Read/Grep/Glob, strict MCP off) | `2.1.278` — events and usage |
-| DeepSeek Harness | Capability probe only (not a dispatch target in 0.1) | `0.2.1-rc.5` — honestly listed as blocked until it passes equal gates |
-| Fake | Offline demo/testing with scripted quota blocks, duplicate events, hangs, non-zero exits | Always labeled simulated; production actions come only from real events |
+## Real and simulated
 
-`wagglepost doctor` reports each runtime's version and capabilities (write / read-only / resume / cancellable).
+| Runtime | 0.1 role |
+| --- | --- |
+| Fake | Offline demo/tests; always labeled simulated; used by deterministic gates |
+| Codex CLI | Discovered from `PATH` or `WAGGLEPOST_CODEX_EXE`; writer only after the P0 version/permission gate |
+| Claude Code | Discovered from `PATH` or `WAGGLEPOST_CLAUDE_EXE`; read-only reviewer in 0.1 |
+| DeepSeek Harness | Capability probe only; not a dispatch target in 0.1 |
+
+CI installs no model, reads no key and starts no real runtime. Fake runs and candidates are always marked simulated and are not evidence of a real model or cross-tool relay.
+
+## Build and gates
+
+```powershell
+cd web; npm ci; npm run build; cd ..
+cargo test --locked --release -- --test-threads=2
+cargo build --locked --release
+
+python -m pip install playwright==1.64.1
+python -m playwright install chromium
+python scripts/run_ui_gates.py --exe target\release\wagglepost.exe --out ci-artifacts
+```
+
+GitHub Actions has one Windows job, `windows-build-test-ui`. It uses `npm ci` and `cargo --locked`, starts the production exe on a random loopback port with a temporary managed root, runs real Chromium, and checks the served assets against `web/dist/ASSETS.sha`. The workflow has `contents: read`, runs on `push` to main and `pull_request`, does not use `pull_request_target`, and has no secrets or model access.
 
 ## Security boundaries
 
-- Loopback-only binding, Host/Origin validation, one-time startup code → HttpOnly session, CSRF for browser mutations; the CLI uses a separate bearer channel.
-- Dirty user repositories are rejected with guidance (commit first or pass an explicit `base_commit`); worktrees are created from explicit commits and never copy uncommitted user changes.
-- Results are collected from local worktree observation (`git diff/status`); agent claims never upgrade into check evidence by themselves. Acceptance binds the task revision + candidate hash.
-- Logs are capped at 2 MiB per attempt; output is truncated before persistence; no telemetry.
+- Binds `127.0.0.1` only; Host/Origin validation; one-time startup code → HttpOnly cookie; CSRF for browser writes.
+- The CLI uses a separate bearer token and can be constrained with `--cli-repo` / `WAGGLEPOST_CLI_ALLOWED_REPOS`.
+- Dirty user repositories are rejected; worktrees come from explicit commits and never copy uncommitted content.
+- Results come from local worktree observation; agent claims do not become independent evidence automatically.
+- stderr is capped at 2 MiB per attempt; logs default to 7-day retention; `doctor` and the Tools page show usage; no telemetry.
+
+## Known limits
+
+- **Platform:** Windows 10/11 x64 is verified. Unix sources compile but have no equivalent acceptance; Linux is not claimed as supported.
+- **Real second writer / cross-tool relay is not accepted yet.** The deterministic evidence is fake reroute only. A real second writer needs its own write gate and a real run. Claude is read-only in 0.1.
+- **Native same-session resume is not proven.** When the same native session cannot be confirmed, the UI explicitly uses a controlled checkpoint fallback and requires preview/re-approval of the full compact handoff.
+- **G7b is not measured.** No real token/cache/whole-task comparison; no savings percentage is claimed.
+- **DSH is probe-only.** Parallel analysis, automatic rework, batched review, external triggers, model proxies and auto-publish are out of 0.1.
+- This is a local single-user tool, not a multi-tenant or public service.
 
 ## Development
 
 ```text
-src/            Rust core (store/events/routing/handoff/runner/adapters/http)
-web/            React/TS frontend (npm run build → web/dist, embedded into the binary)
-tests/          G1–G8 offline gates (fake runtime, deterministic, no network)
-scripts/        ui_gates.py (Playwright behavioral gates)
+src/        Rust core / HTTP / runner / adapters / store
+web/        React + TypeScript; npm run build → web/dist (verified and embedded at build time)
+tests/      G1–G8 and WP regressions; fake, offline, deterministic by default
+scripts/    ui_gates.py and run_ui_gates.py (real production exe + Chromium)
 ```
 
-```powershell
-cargo test                                      # 25 offline gates
-cd web; npm install; npm run build; cd ..       # rebuild the frontend, then cargo build re-embeds it
-python scripts/ui_gates.py http://127.0.0.1:8765 <startup-code>   # 11 browser gates
-```
-
-## Known limits (0.1)
-
-- A real cross-tool writer handoff requires the second native adapter to pass the write gate independently; in this batch it has not, so reroute candidates show the blocker honestly and keep patch export plus manual takeover.
-- Parallel analysis, automatic rework, batched review comments, external triggers/notifications, model proxies, and automatic publishing are out of scope for 0.1.
-- Windows 10 x64 is the accepted platform; Unix paths compile but lack equivalent acceptance.
-
-License: MIT
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). License: [MIT](LICENSE).

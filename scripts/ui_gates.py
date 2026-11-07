@@ -6,9 +6,12 @@ Run:  python scripts/ui_gates.py http://127.0.0.1:8765 <startup-code>
 """
 import io
 import json
+import os
 import sys
+import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -16,6 +19,9 @@ from playwright.sync_api import sync_playwright
 
 BASE = sys.argv[1].rstrip("/")
 CODE = sys.argv[2]
+OUT_DIR = Path(os.environ.get("WAGGLEPOST_UI_OUT_DIR", tempfile.gettempdir()))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_FILE = os.environ.get("WAGGLEPOST_SESSION_FILE", "")
 
 results = []
 PAGE_ERRORS = []
@@ -63,7 +69,9 @@ def wait_task_status(page, statuses, timeout_s=90):
 
 def auth_headers():
     # cookie session already in the browser context; server needs Origin+CSRF for POST
-    csrf = json.load(open(r"D:\dev\wagglepost-workspaces\cli-session.json", encoding="utf-8"))["csrf"]
+    if not SESSION_FILE:
+        raise AssertionError("WAGGLEPOST_SESSION_FILE is required for this helper")
+    csrf = json.load(open(SESSION_FILE, encoding="utf-8"))["csrf"]
     return {"X-CSRF-Token": csrf, "Origin": BASE}
 
 
@@ -359,14 +367,14 @@ def main():
         page.set_viewport_size({"width": 1440, "height": 900})
         page.get_by_role("button", name="工作台").or_(page.get_by_role("button", name="Desk")).first.click()
         page.wait_for_timeout(400)
-        page.screenshot(path=r"D:\code\Improvement\artifacts\wagglepost-p2\ui-1440-light.png", full_page=False)
+        page.screenshot(path=str(OUT_DIR / "ui-1440-light.png"), full_page=False)
         page.get_by_label("toggle theme").click()
         page.wait_for_timeout(300)
-        page.screenshot(path=r"D:\code\Improvement\artifacts\wagglepost-p2\ui-1440-dark.png", full_page=False)
+        page.screenshot(path=str(OUT_DIR / "ui-1440-dark.png"), full_page=False)
         page.get_by_label("toggle theme").click()
         page.set_viewport_size({"width": 390, "height": 800})
         page.wait_for_timeout(300)
-        page.screenshot(path=r"D:\code\Improvement\artifacts\wagglepost-p2\ui-390.png", full_page=False)
+        page.screenshot(path=str(OUT_DIR / "ui-390.png"), full_page=False)
         browser.close()
 
     passed = sum(1 for _, s, _ in results if s == "PASS")
@@ -374,7 +382,7 @@ def main():
     json.dump(
         {"results": [{"name": n, "status": s, "err": e} for n, s, e in results],
          "page_errors": PAGE_ERRORS, "external_requests": EXTERNAL_REQUESTS},
-        open(r"D:\code\Improvement\artifacts\wagglepost-p2\ui-gates.json", "w", encoding="utf-8"),
+        open(OUT_DIR / "ui-gates.json", "w", encoding="utf-8"),
         ensure_ascii=False, indent=1,
     )
     if passed != len(results):

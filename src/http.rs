@@ -14,14 +14,19 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct AppState {
     pub core: Arc<Core>,
+    /// Browser session cookie token. Never written to the CLI session file.
     pub session_token: String,
+    /// Separate bearer token for the CLI / main-agent channel.
+    pub cli_token: String,
+    /// Optional CLI repository allowlist; empty preserves legacy unrestricted CLI.
+    pub cli_allowed_repos: Vec<String>,
     pub csrf_token: String,
     /// set of trusted origins observed at boot (loopback only)
     pub port: u16,
@@ -177,12 +182,52 @@ fn auth_context(state: &SharedState, headers: &HeaderMap) -> (bool, bool) {
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == format!("Bearer {}", state.session_token))
+        .map(|v| v == format!("Bearer {}", state.cli_token))
         .unwrap_or(false);
     let cookie = session_cookie(headers)
         .map(|v| v == state.session_token)
         .unwrap_or(false);
     (bearer, cookie)
+}
+
+fn normalize_repo(p: &str) -> String {
+    let p = std::fs::canonicalize(p)
+        .map(|x| x.to_string_lossy().to_string())
+        .unwrap_or_else(|_| p.to_string());
+    p.trim_end_matches(['/', '\\'])
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn cli_repo_allowed(state: &SharedState, bearer: bool, repo_path: &str) -> bool {
+    if !bearer || state.cli_allowed_repos.is_empty() {
+        return true;
+    }
+    let repo = normalize_repo(repo_path);
+    state
+        .cli_allowed_repos
+        .iter()
+        .any(|allowed| normalize_repo(allowed) == repo)
+}
+
+fn task_repo_allowed(state: &SharedState, bearer: bool, task_id: &str) -> bool {
+    if !bearer || state.cli_allowed_repos.is_empty() {
+        return true;
+    }
+    state
+        .core
+        .store
+        .get_task(task_id)
+        .map(|t| cli_repo_allowed(state, true, &t.repo_path))
+        .unwrap_or(false)
+}
+
+fn repo_forbidden() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "repo_not_authorized",
+        "this CLI session is not authorized for that repository",
+    )
 }
 
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
@@ -279,8 +324,13 @@ async fn list_tasks(State(state): State<SharedState>, headers: HeaderMap) -> Res
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
-    let tasks = state.core.store.list_tasks();
-    let inbox = state.core.inbox();
+    let mut tasks = state.core.store.list_tasks();
+    let mut inbox = state.core.inbox();
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        tasks.retain(|t| cli_repo_allowed(&state, true, &t.repo_path));
+        let visible: HashSet<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        inbox.retain(|m| visible.contains(&m.task_id));
+    }
     Json(json!({"tasks": tasks, "inbox": inbox})).into_response()
 }
 
@@ -292,6 +342,11 @@ async fn create_task(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if let Some(repo) = body.get("repo_path").and_then(|r| r.as_str()) {
+        if !cli_repo_allowed(&state, bearer, repo) {
+            return repo_forbidden();
+        }
     }
     // idempotency: Idempotency-Key header or request_id in body
     let request_id = headers
@@ -396,6 +451,9 @@ async fn trust_repo(
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     let task = match state.core.store.get_task(&id) {
         Some(t) => t,
         None => return error_response(StatusCode::NOT_FOUND, "not_found", "task not found"),
@@ -416,6 +474,9 @@ async fn create_plan_route(
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     let writer = body.get("writer_adapter").and_then(|w| w.as_str()).map(|s| s.to_string());
     match state.core.create_plan(&id, writer) {
         Ok(plan) => {
@@ -435,6 +496,9 @@ async fn approve_plan(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
     }
     let hash = body
         .get("summary_hash")
@@ -504,6 +568,9 @@ async fn route_preview(
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     let role = match q.role.as_deref() {
         Some("reviewer") => Role::Reviewer,
         _ => Role::Writer,
@@ -523,6 +590,9 @@ async fn dispatch(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
     }
     let request_id = headers
         .get("idempotency-key")
@@ -579,6 +649,9 @@ async fn get_task(State(state): State<SharedState>, Path(id): Path<String>, head
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     match state.core.task_snapshot(&id) {
         Some(snap) => Json(snap).into_response(),
         None => error_response(StatusCode::NOT_FOUND, "not_found", "task not found"),
@@ -589,6 +662,11 @@ async fn get_attempt(State(state): State<SharedState>, Path(id): Path<String>, h
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
+    }
+    if let Some(a) = state.core.store.get_attempt(&id) {
+        if !task_repo_allowed(&state, bearer, &a.task_id) {
+            return repo_forbidden();
+        }
     }
     match state.core.store.get_attempt(&id) {
         Some(a) => Json(json!({"attempt": a})).into_response(),
@@ -605,6 +683,11 @@ async fn cancel_attempt(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if let Some(a) = state.core.store.get_attempt(&id) {
+        if !task_repo_allowed(&state, bearer, &a.task_id) {
+            return repo_forbidden();
+        }
     }
     let request_id = headers
         .get("idempotency-key")
@@ -643,7 +726,11 @@ async fn list_decisions(
         return r;
     }
     let open_only = q.get("status").map(|s| s == "open").unwrap_or(false);
-    Json(json!({"decisions": state.core.store.list_decisions(open_only)})).into_response()
+    let mut decisions = state.core.store.list_decisions(open_only);
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        decisions.retain(|d| task_repo_allowed(&state, true, &d.task_id));
+    }
+    Json(json!({"decisions": decisions})).into_response()
 }
 
 async fn answer_decision(
@@ -655,6 +742,11 @@ async fn answer_decision(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if let Some(d) = state.core.store.get_decision(&id) {
+        if !task_repo_allowed(&state, bearer, &d.task_id) {
+            return repo_forbidden();
+        }
     }
     let option_id = body
         .get("option_id")
@@ -718,6 +810,9 @@ async fn reroute(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
+    }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
     }
     let target = body
         .get("target_adapter")
@@ -788,6 +883,9 @@ async fn accept(
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     let cand = body
         .get("candidate_hash")
         .and_then(|c| c.as_str())
@@ -834,6 +932,9 @@ async fn handoff_preview(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
+    }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
     }
     // preview the handoff that the NEXT step would send (writer or reviewer)
     let role = q.get("role").map(|r| match r.as_str() {
@@ -882,6 +983,9 @@ async fn task_diff(
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
+    }
     let Some(cand) = state.core.store.current_candidate(&id) else {
         return error_response(StatusCode::NOT_FOUND, "not_found", "no candidate");
     };
@@ -906,7 +1010,11 @@ async fn list_messages(State(state): State<SharedState>, headers: HeaderMap) -> 
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
-    Json(json!({"messages": state.core.inbox()})).into_response()
+    let mut messages = state.core.inbox();
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        messages.retain(|m| task_repo_allowed(&state, true, &m.task_id));
+    }
+    Json(json!({"messages": messages})).into_response()
 }
 
 async fn resume_options(
@@ -917,6 +1025,9 @@ async fn resume_options(
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
+    }
+    if !task_repo_allowed(&state, bearer, &id) {
+        return repo_forbidden();
     }
     let (same_session, native_id) = state.core.resume_same_session_possible(&id);
     Json(json!({
@@ -944,6 +1055,13 @@ async fn get_request(State(state): State<SharedState>, Path(id): Path<String>, h
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
+    }
+    if let Some(rec) = state.core.store.get_request(&id) {
+        if let Some(tid) = rec.task_id.as_deref() {
+            if !task_repo_allowed(&state, bearer, tid) {
+                return repo_forbidden();
+            }
+        }
     }
     match state.core.store.get_request(&id) {
         Some(rec) => {
@@ -982,8 +1100,22 @@ async fn sse_events(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    // replay missed events from the store (window), then live
-    let missed = state.core.store.list_events_after(last_id, 500);
+    // replay missed events from the store (window), then live. A client that is
+    // outside the 500-event window gets an explicit resync signal so it refetches
+    // the authoritative snapshot instead of silently rendering a gap.
+    let mut missed = state.core.store.list_events_after(last_id, 501);
+    let mut gap = missed.len() > 500;
+    if last_id > 0 && missed.is_empty() && state.core.bus.current_seq() < last_id {
+        gap = true;
+    }
+    if let Some(first) = missed.first() {
+        if last_id > 0 && first.seq > last_id + 1 {
+            gap = true;
+        }
+    }
+    if missed.len() > 500 {
+        missed = missed.split_off(missed.len() - 500);
+    }
     let live = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
@@ -1005,10 +1137,32 @@ async fn sse_events(
                         rx,
                     ));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let data = serde_json::json!({
+                        "kind": "resync",
+                        "payload": {"reason": "lagged", "skipped": skipped},
+                    });
+                    return Some((
+                        Ok::<_, Infallible>(
+                            SseEvent::default().event("resync").data(data.to_string()),
+                        ),
+                        rx,
+                    ));
+                }
                 Err(_) => return None,
             }
         }
+    });
+    let resync = futures_util::stream::once(async move {
+        let data = serde_json::json!({
+            "kind": "resync",
+            "payload": {"reason": "replay_window", "last_event_id": last_id},
+        });
+        Ok::<_, Infallible>(
+            SseEvent::default()
+                .event("resync")
+                .data(data.to_string()),
+        )
     });
     let replay = futures_util::stream::iter(missed.into_iter().map(|ev| {
         let data = serde_json::json!({
@@ -1025,6 +1179,10 @@ async fn sse_events(
             .id(ev.seq.to_string())
             .data(data.to_string()))
     }));
-    let stream = replay.chain(live);
+    let stream = if gap {
+        resync.chain(replay).chain(live).boxed()
+    } else {
+        replay.chain(live).boxed()
+    };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")).into_response()
 }

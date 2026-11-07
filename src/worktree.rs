@@ -175,33 +175,54 @@ impl Default for GitConfig {
 }
 
 pub fn default_git_exe() -> PathBuf {
-    let candidates = [
-        PathBuf::from("D:\\dev\\Git\\cmd\\git.exe"),
-        PathBuf::from("git"),
-    ];
-    for c in candidates {
-        if c.is_file() || which_ok(&c) {
-            return c;
+    if let Ok(p) = std::env::var("WAGGLEPOST_GIT_EXE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return p;
         }
     }
-    PathBuf::from("git")
+    find_in_path("git").unwrap_or_else(|| PathBuf::from("git"))
 }
 
-fn which_ok(exe: &Path) -> bool {
-    std::env::var("PATH")
-        .map(|p| {
-            p.split(';').any(|dir| {
-                let full = Path::new(dir).join(exe);
-                full.is_file()
-            })
-        })
-        .unwrap_or(false)
+/// Locate an executable on PATH without assuming a personal install directory.
+/// On Windows the usual PATHEXT suffixes are tried as well.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let mut candidates = vec![name.to_string()];
+    #[cfg(windows)]
+    {
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".exe") && !lower.ends_with(".cmd") && !lower.ends_with(".bat") {
+            for ext in [".exe", ".cmd", ".bat"] {
+                candidates.push(format!("{name}{ext}"));
+            }
+        }
+    }
+    for dir in std::env::split_paths(&path) {
+        for c in &candidates {
+            let full = dir.join(c);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
 }
 
 pub fn default_managed_root() -> PathBuf {
-    std::env::var("WAGGLEPOST_MANAGED_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("D:\\dev\\wagglepost-workspaces"))
+    if let Ok(p) = std::env::var("WAGGLEPOST_MANAGED_ROOT") {
+        return PathBuf::from(p);
+    }
+    if let Ok(p) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(p).join("WagglePost");
+    }
+    if let Ok(p) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(p).join("wagglepost");
+    }
+    if let Ok(p) = std::env::var("HOME") {
+        return PathBuf::from(p).join(".local/state/wagglepost");
+    }
+    std::env::temp_dir().join("wagglepost")
 }
 
 pub fn run_git(

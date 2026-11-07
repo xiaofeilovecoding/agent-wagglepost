@@ -197,6 +197,7 @@ function useSse(onEvent: (ev: any) => void) {
         "cancel_requested",
         "attempt_failed",
         "attempt_cancelled",
+        "resync",
       ]) {
         es.addEventListener(kind, handle as EventListener);
       }
@@ -312,6 +313,13 @@ function App() {
 
   // SSE: refresh + real-event flight (dedupe by seq handled in useSse)
   useSse((ev) => {
+    if (ev.kind === "resync") {
+      // replay window/lagged stream: refetch the authoritative snapshot instead
+      // of rendering a silent gap; no animation for a resync marker
+      refreshTasks();
+      if (selected) refreshTask(selected);
+      return;
+    }
     if (ev.task_id && ev.task_id === selected) {
       refreshTask(ev.task_id);
       const kind = FLIGHT_KINDS[ev.kind];
@@ -603,7 +611,7 @@ function NewTask({ lang, onDone }: { lang: Lang; onDone: (id: string) => void })
         </label>
         <label>
           {t("repoField", lang)}
-          <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="D:\path\to\repo" />
+          <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="repository path / 仓库路径" />
         </label>
         <label>
           {t("recipeField", lang)}
@@ -1173,6 +1181,19 @@ function Tools({ lang, doctor, onBack }: { lang: Lang; doctor: any; onBack: () =
           </div>
         ))}
       </div>
+      {doctor?.logs && (
+        <div className="footer">
+          <p className="muted">
+            {lang === "zh" ? "日志占用" : "Log usage"}: {doctor.logs.files} files · {doctor.logs.bytes} bytes ·{" "}
+            {lang === "zh" ? "保留" : "retention"} {doctor.logs.retention_days}d ·{" "}
+            <code>{doctor.logs.dir}</code>
+          </p>
+          <p className="muted">
+            {lang === "zh" ? "受管根" : "Managed root"}: <code>{doctor.managed_root}</code>
+            {doctor.free_bytes != null ? ` · free ${doctor.free_bytes} bytes` : ""}
+          </p>
+        </div>
+      )}
       <div className="footer">
         <button onClick={onBack}>{t("backToDesk", lang)}</button>
       </div>
