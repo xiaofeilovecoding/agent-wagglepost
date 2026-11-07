@@ -30,7 +30,8 @@ wagglepost submit --file draft.json --json    # submit a draft (awaiting approva
 wagglepost status <task_id> --json            # task snapshot (receipt + timeline)
 wagglepost inbox --after <seq> --json         # inbox (needs attention / collected)
 wagglepost request show <request_id> --json   # request reconciliation by original ID
-wagglepost answer <decision_id> <option_id> --json   # answer a decision card
+wagglepost answer <decision_id> <option_id>          # preview the relay body (nothing sent)
+wagglepost answer <decision_id> <option_id> --digest <sha256>   # confirm with the reviewed digest (queues)
 wagglepost why <task_id> --json               # route reasons + events
 ```
 

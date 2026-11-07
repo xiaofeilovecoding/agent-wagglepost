@@ -31,7 +31,8 @@ wagglepost submit --file draft.json --json    # 提交任务草案（默认入�
 wagglepost status <task_id> --json            # 任务快照（含回执与时间线）
 wagglepost inbox --after <seq> --json         # 收件箱（待你处理 / 已回收）
 wagglepost request show <request_id> --json   # 请求对账（响应未知时按原 ID 查）
-wagglepost answer <decision_id> <option_id> --json   # 决策卡答后排队
+wagglepost answer <decision_id> <option_id>          # 预览将发送的交接正文（不提交、不启动）
+wagglepost answer <decision_id> <option_id> --digest <sha256>   # 确认提交（摘要须与预览一致；答后排队）
 wagglepost why <task_id> --json               # 路由原因 + 事件
 ```
 

@@ -5,8 +5,6 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::time::Duration;
 
-const BS: char = 92 as char;
-
 pub fn run(args: &[String]) -> i32 {
     let flag_value = |name: &str| -> Option<String> {
         args.iter()

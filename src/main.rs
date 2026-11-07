@@ -48,7 +48,9 @@ fn print_usage() {
            wagglepost status <task_id> --json                    task snapshot\n\
            wagglepost inbox [--after SEQ] --json                 inbox messages\n\
            wagglepost request show <request_id> --json           request reconciliation\n\
-           wagglepost answer <decision_id> <option_id> --json    answer a decision card\n\
+           wagglepost answer <decision_id> <option_id>           preview the relay body (nothing sent)\n\
+           wagglepost answer <decision_id> <option_id> --digest <d>\n\
+                                                                 confirm with the reviewed digest\n\
            wagglepost why <task_id> --json                       route reasons + events\n\
            wagglepost dispatch <task_id> --json                  dispatch next step\n\
            wagglepost accept <task_id> <candidate_hash> --json   accept a candidate\n\

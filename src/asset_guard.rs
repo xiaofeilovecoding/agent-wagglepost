@@ -9,12 +9,6 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(digest))
 }
 
-pub fn file_mtime(path: &Path) -> Result<SystemTime, String> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("mtime {}: {e}", path.display()))
-}
-
 /// Verify every `digest  filename` line in the manifest against the actual files.
 /// Missing manifest, missing files, or content changes all fail.
 pub fn verify_manifest(dist_dir: &Path) -> Result<(), String> {
