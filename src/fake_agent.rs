@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::time::Duration;
 
+const BS: char = 92 as char;
+
 pub fn run(args: &[String]) -> i32 {
     let flag_value = |name: &str| -> Option<String> {
         args.iter()
@@ -70,9 +72,23 @@ pub fn run(args: &[String]) -> i32 {
         if let Some(files) = script.get("files").and_then(|f| f.as_object()) {
             for (path, content) in files {
                 let content = content.as_str().unwrap_or("");
+                // WP13: the fake agent may only write INSIDE the task worktree.
+                // Reject absolute paths, drive-relative paths, parent traversal and
+                // symlink/reparse-point escapes — fail closed with a nonzero exit.
+                if let Err(reason) = validate_workspace_path(std::path::Path::new(path)) {
+                    out(json!({"fake": "1", "type": "error", "message": format!("write rejected: {reason}"), "simulated": true}));
+                    eprintln!("fake-agent: write rejected ({reason}): {path}");
+                    return 3;
+                }
                 let full = std::path::Path::new(path);
                 if let Some(parent) = full.parent() {
                     let _ = std::fs::create_dir_all(parent);
+                }
+                // re-check after mkdir: an ancestor may have been swapped
+                if let Err(reason) = validate_no_symlink_ancestors(full) {
+                    out(json!({"fake": "1", "type": "error", "message": format!("write rejected: {reason}"), "simulated": true}));
+                    eprintln!("fake-agent: write rejected ({reason}): {path}");
+                    return 3;
                 }
                 let ok = std::fs::write(full, content).is_ok();
                 out(json!({"fake": "1", "type": "file_write", "path": path, "ok": ok, "simulated": true}));
@@ -113,3 +129,43 @@ pub fn run(args: &[String]) -> i32 {
     }
     exit_code.clamp(0, 255) as i32
 }
+
+/// WP13: lexical + link validation — the fake agent may only write inside the
+/// task worktree it was launched in.
+fn validate_workspace_path(rel: &std::path::Path) -> Result<(), String> {
+    use std::path::Component;
+    if rel.is_absolute() {
+        return Err("absolute path".into());
+    }
+    let mut has_drive = false;
+    for comp in rel.components() {
+        match comp {
+            Component::ParentDir => return Err("parent traversal".into()),
+            Component::Prefix(_) => has_drive = true,
+            Component::RootDir => return Err("rooted path".into()),
+            _ => {}
+        }
+    }
+    if has_drive {
+        return Err("drive-scoped path".into());
+    }
+    Ok(())
+}
+
+/// Reject symlink/reparse-point escapes: any existing ancestor of the target
+/// (below the cwd) that is a link means the write could leave the workspace.
+fn validate_no_symlink_ancestors(target: &std::path::Path) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    // check each component for symlinks
+    let mut cur = cwd.clone();
+    for comp in target.components() {
+        cur = cur.join(comp);
+        if let Ok(md) = std::fs::symlink_metadata(&cur) {
+            if md.file_type().is_symlink() {
+                return Err(format!("symlink escape at {}", cur.display()));
+            }
+        }
+    }
+    Ok(())
+}
+

@@ -168,6 +168,9 @@ pub struct SubmitInput {
     pub title: String,
     /// explicitly approved resume budget at submission time (WP10), default 1
     pub resume_budget: Option<u64>,
+    /// server-controlled demo preset kind ("decision"|"reroute"); only for
+    /// all-simulated tasks — no script content ever crosses the API (WP13)
+    pub demo: Option<String>,
     pub goal: String,
     pub acceptance: Vec<String>,
     pub repo_path: String,
@@ -445,6 +448,22 @@ Sample repository for the offline wagglepost tour.
             created_at: now.clone(),
             updated_at: now,
         };
+        // WP13: demo presets are server-controlled; only all-simulated tasks may use
+        // them, and the kind is pinned at submission (immutable after approval).
+        if let Some(kind) = &input.demo {
+            if !matches!(kind.as_str(), "decision" | "reroute") {
+                return Err(CoreError::bad("demo_unknown", "unknown demo kind"));
+            }
+            let all_fake = task.allowed_adapters.iter().all(|a| a == "fake");
+            if !all_fake {
+                return Err(CoreError::bad(
+                    "demo_requires_fake",
+                    "demo presets are only available for all-simulated tasks",
+                ));
+            }
+            self.store
+                .meta_set(&format!("demo_kind:{}", task.task_id), kind);
+        }
         self.store.insert_task(&task)?;
         self.bus.emit(
             Some(&task.task_id),
@@ -1040,6 +1059,29 @@ Sample repository for the offline wagglepost tour.
         }
         // default fake script: writer writes a small file, reviewer passes.
         // tests can override via meta key fake_script:<task_id>:<step>
+        // WP13: server-controlled demo presets (pinned at submission, immutable after
+        // approval — no script content ever crosses the API)
+        if let Some(kind) = self.store.meta_get(&format!("demo_kind:{}", task.task_id)) {
+            if step.role == Role::Writer && generation == 1 {
+                if kind == "decision" {
+                    return Some(json!({
+                        "behaviors": ["write_files"],
+                        "files": {"README.md": "# demo\n\nSample repository for the offline wagglepost tour.\npartial work (simulated)\n"},
+                        "result": {
+                            "status": "needs_decision",
+                            "question": "保留已写内容并继续吗？",
+                            "options": [{"id": "opt_go", "label": "保留并继续", "effect": "从检查点续跑"}]
+                        }
+                    }));
+                }
+                if kind == "reroute" {
+                    return Some(json!({
+                        "behaviors": ["write_files", "quota_block"],
+                        "files": {"README.md": "# demo\n\nSample repository for the offline wagglepost tour.\nquota-blocked partial work (simulated)\n"}
+                    }));
+                }
+            }
+        }
         let script_key = format!("fake_script:{}:{}", task.task_id, step.step_id);
         if let Some(s) = self.store.meta_get(&script_key) {
             if !s.is_empty() {

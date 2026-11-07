@@ -510,25 +510,6 @@ function DeskEmpty({ lang, tasks, inbox, onSelect, showToast }: { lang: Lang; ta
 
 function SampleButton({ lang, onDone, onError, kind }: { lang: Lang; onDone: (id: string) => void; onError?: (m: string) => void; kind: "decision" | "reroute" }) {
   const [busy, setBusy] = useState(false);
-  const scripts: Record<string, any> = {
-    decision: {
-      gen1: {
-        behaviors: ["write_files"],
-        files: { "README.md": "# demo\n\nSample repository for the offline wagglepost tour.\npartial work (simulated)\n" },
-        result: {
-          status: "needs_decision",
-          question: lang === "zh" ? "保留已写内容并继续吗？" : "Keep the partial work and continue?",
-          options: [{ id: "opt_go", label: lang === "zh" ? "保留并继续" : "Keep and continue", effect: lang === "zh" ? "从检查点续跑" : "Resume from the checkpoint" }],
-        },
-      },
-    },
-    reroute: {
-      gen1: {
-        behaviors: ["write_files", "quota_block"],
-        files: { "README.md": "# demo\n\nSample repository for the offline wagglepost tour.\nquota-blocked partial work (simulated)\n" },
-      },
-    },
-  };
   const submitSample = async () => {
     const r = await api.submit(
       {
@@ -538,6 +519,7 @@ function SampleButton({ lang, onDone, onError, kind }: { lang: Lang; onDone: (id
         repo_path: "sample:demo",
         recipe: "write_then_review",
         allowed_adapters: ["fake"],
+        demo: kind,
         acceptance: [lang === "zh" ? "样例任务完整走完（模拟）" : "Sample task completes (simulated)"],
         ...(kind === "reroute" ? { resume_budget: 3 } : {}),
       },
@@ -557,10 +539,9 @@ function SampleButton({ lang, onDone, onError, kind }: { lang: Lang; onDone: (id
       onClick={async () => {
         setBusy(true);
         try {
+          // WP13: the demo preset is pinned via `demo` in the submit body; no script
+          // content crosses the API
           const id = await submitSample();
-          // pin the gen-1 fake script for this task (server-side demo script)
-          const script = scripts[kind].gen1;
-          await api.sampleScript(id, "s1", script);
           onDone(id);
         } catch (e) {
           const msg = e instanceof ApiError ? `${e.code}: ${e.message}` : String(e);

@@ -330,14 +330,16 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
                 eprintln!("no open decision card found for this id");
                 return 1;
             };
+            let task_id = open["task_id"].as_str().unwrap_or("").to_string();
             let rev = open["revision"].as_u64().unwrap_or(0);
-            // WP09: preview the exact relay body (with this choice applied) and bind it
+            // WP09 CLI: preview the exact relay body (with this choice applied) and
+            // print it. NOTHING is submitted without the user passing the digest.
             let prev = match http_req(
                 port,
                 &token,
                 &csrf,
                 "GET",
-                &format!("/v1/tasks/{}/handoff-preview?decision={id}&option={opt}", open["task_id"].as_str().unwrap_or("")),
+                &format!("/v1/tasks/{task_id}/handoff-preview?decision={id}&option={opt}"),
                 None,
                 None,
             ) {
@@ -348,18 +350,27 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
                 }
             };
             let digest = prev["approved_digest"].as_str().unwrap_or("").to_string();
-            println!("relay body digest: {digest}");
-            println!("{}", prev["handoff"]["text"].as_str().unwrap_or(""));
-            let rid = format!("cli-{}", wagglepost::ids::new_token()[..12].to_string());
-            http_req(
-                port,
-                &token,
-                &csrf,
-                "POST",
-                &format!("/v1/decisions/{id}/answer"),
-                Some(&json!({"option_id": opt, "revision": rev, "handoff_digest": digest})),
-                Some(&rid),
-            )
+            let body_text = prev["handoff"]["text"].as_str().unwrap_or("");
+            let body_bytes = prev["handoff"]["bytes"].as_u64().unwrap_or(0);
+            if let Some(user_digest) = flag_value(&args, "--digest") {
+                // confirm step: submit with the USER-PASSED digest (never auto-fetched)
+                let rid = format!("cli-{}", wagglepost::ids::new_token()[..12].to_string());
+                http_req(
+                    port,
+                    &token,
+                    &csrf,
+                    "POST",
+                    &format!("/v1/decisions/{id}/answer"),
+                    Some(&json!({"option_id": opt, "revision": rev, "handoff_digest": user_digest})),
+                    Some(&rid),
+                )
+            } else {
+                println!("=== relay body ({} bytes) ===", body_bytes);
+                println!("{}", body_text);
+                println!("=== digest: {digest} ===");
+                println!("re-run with --digest {digest} to approve and queue");
+                Ok(json!({"previewed": true, "digest": digest}))
+            }
         }
         "why" => {
             let id = args.first().cloned().unwrap_or_default();

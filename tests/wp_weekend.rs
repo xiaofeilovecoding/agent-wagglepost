@@ -227,3 +227,295 @@ fn wp09e_reviewer_body_bound_at_freeze() {
         "reviewer launched with the frozen approved body"
     );
 }
+// ---------- 午后复审: WP13 — demo presets server-side, fake write boundary ----------
+
+#[test]
+fn wp13_sample_script_endpoint_removed_and_demo_presets_server_side() {
+    let env = TestEnv::new();
+    let (task_id, _) = env.ready_task("direct", Some("fake"), None);
+    // the script-upload endpoint is GONE (404/405) — arbitrary scripts cannot cross HTTP
+    let r = env.req(
+        "POST",
+        &format!("/v1/tasks/{task_id}/sample-script"),
+        Some(&json!({"step": "s1", "script": {"behaviors": ["write_files"], "files": {"x.txt": "x"}}})),
+        Some("wp13-pin"),
+    );
+    assert!(
+        r.is_err(),
+        "the sample-script upload endpoint must not exist"
+    );
+    let code = r.unwrap_err().0;
+    assert!(code == 404 || code == 405, "gone or method-not-allowed, got {code}");
+    // demo presets are server-side: submitting with demo="decision" runs the built-in
+    // decision preset WITHOUT any script content crossing HTTP
+    let body = json!({
+        "goal": "demo decision preset probe",
+        "repo_path": env.user_repo.to_string_lossy(),
+        "recipe": "direct",
+        "allowed_adapters": ["fake"],
+        "demo": "decision",
+    });
+    let resp = env.req("POST", "/v1/tasks", Some(&body), Some("wp13-demo")).expect("demo submit");
+    let tid = resp["task"]["task_id"].as_str().unwrap().to_string();
+    env.req("POST", &format!("/v1/tasks/{tid}/trust"), Some(&json!({})), None).expect("trust");
+    let plan = env.req("POST", &format!("/v1/tasks/{tid}/plan"), Some(&json!({})), None).expect("plan");
+    env.req("POST", &format!("/v1/tasks/{tid}/plan/approve"), Some(&json!({"summary_hash": plan["plan"]["summary_hash"]})), None).expect("approve");
+    env.req("POST", &format!("/v1/tasks/{tid}/dispatch"), Some(&json!({})), Some("wp13-d1")).expect("dispatch");
+    let status = env.run_until(&tid, &["waiting_decision"], Duration::from_secs(60));
+    assert_eq!(status, "waiting_decision", "the built-in decision preset ran");
+}
+
+#[test]
+fn wp13_demo_preset_requires_all_fake_adapters() {
+    let env = TestEnv::new();
+    let body = json!({
+        "goal": "g", "repo_path": env.user_repo.to_string_lossy(),
+        "recipe": "direct", "allowed_adapters": ["fake", "codex"], "demo": "decision",
+    });
+    let err = env.req("POST", "/v1/tasks", Some(&body), Some("wp13-mixed")).unwrap_err();
+    assert_eq!(err.1["error"]["code"], json!("demo_requires_fake"), "demo presets are fake-only");
+}
+
+// black-box: the REAL fake-agent binary rejects out-of-workspace write paths
+fn run_fake_with_files(cwd: &std::path::Path, files_json: &str) -> std::process::Output {
+    let exe = env!("CARGO_BIN_EXE_wagglepost");
+    let script_path = cwd.join("_wp13_script.json");
+    std::fs::write(
+        &script_path,
+        format!("{{\"behaviors\": [\"write_files\"], \"files\": {files_json}}}"),
+    )
+    .unwrap();
+    let capture = cwd.join("_wp13_capture.txt");
+    let out = std::process::Command::new(exe)
+        .args([
+            "__fake-agent",
+            "--script",
+            script_path.to_string_lossy().as_ref(),
+            "--capture",
+            capture.to_string_lossy().as_ref(),
+        ])
+        .current_dir(cwd)
+        .output()
+        .expect("spawn fake agent");
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&capture);
+    out
+}
+
+#[test]
+fn wp13_fake_rejects_absolute_paths() {
+    let env = TestEnv::new();
+    let outside = env.managed_root.parent().unwrap().join("wp13-outside-marker.txt");
+    let _ = std::fs::remove_file(&outside);
+    let outside_str = outside.to_string_lossy().replace('\\', "/");
+    let out = run_fake_with_files(
+        &env.user_repo,
+        &format!("{{\"{outside_str}\": \"marker content\"}}"),
+    );
+    assert!(
+        !out.status.success(),
+        "fake agent must fail on absolute write paths"
+    );
+    assert!(
+        !outside.exists(),
+        "marker outside the workspace must not be written"
+    );
+}
+
+#[test]
+fn wp13_fake_rejects_traversal_paths() {
+    let env = TestEnv::new();
+    let outside = env
+        .managed_root
+        .parent()
+        .unwrap()
+        .join("wp13-traversal-marker.txt");
+    let _ = std::fs::remove_file(&outside);
+    let outside_str = outside.to_string_lossy().replace('\\', "/");
+    // traversal from the worktree: enough .. to reach above the managed root
+    let out = run_fake_with_files(
+        &env.user_repo,
+        &format!("{{\"../../../../../{outside_str}\": \"marker content\"}}"),
+    );
+    assert!(!out.status.success(), "fake agent must fail on parent traversal");
+    assert!(
+        !outside.exists(),
+        "marker above the workspace must not be written"
+    );
+}
+
+#[test]
+fn wp13_fake_rejects_drive_relative_paths() {
+    let env = TestEnv::new();
+    let marker = env.managed_root.parent().unwrap().join("wp13-drive-marker.txt");
+    let _ = std::fs::remove_file(&marker);
+    // drive-relative path "D:wp13-drive-marker.txt" resolves against the D: cwd
+    let out = run_fake_with_files(
+        &env.user_repo,
+        &format!("{{\"D:{}\": \"marker content\"}}", "wp13-drive-marker.txt"),
+    );
+    assert!(!out.status.success(), "fake agent must fail on drive-relative paths");
+    assert!(
+        !marker.exists(),
+        "drive-relative marker must not be written"
+    );
+}
+
+// ---------- 午后复审: WP12 — asset content digest verification ----------
+
+#[test]
+fn wp12_manifest_detects_content_change_and_missing_files() {
+    let dir = std::env::temp_dir().join(format!("wp12-{}", wagglepost::ids::new_token()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // valid assets + manifest
+    std::fs::write(dir.join("app.js"), "console.log(1);").unwrap();
+    let digest = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(std::fs::read(dir.join("app.js")).unwrap());
+        hex::encode(h.finalize())
+    };
+    std::fs::write(dir.join("ASSETS.sha"), format!("{digest}  app.js\n")).unwrap();
+    // matching manifest passes
+    assert!(wagglepost::asset_guard::verify_manifest(&dir).is_ok());
+    // content change → mismatch
+    std::fs::write(dir.join("app.js"), "console.log(2);").unwrap();
+    assert!(
+        wagglepost::asset_guard::verify_manifest(&dir).is_err(),
+        "replaced app.js must fail the manifest check"
+    );
+    // missing file → fail
+    std::fs::remove_file(dir.join("app.js")).unwrap();
+    assert!(wagglepost::asset_guard::verify_manifest(&dir).is_err(), "missing asset fails");
+    // missing manifest → fail
+    std::fs::remove_file(dir.join("ASSETS.sha")).unwrap();
+    std::fs::write(dir.join("app.js"), "x").unwrap();
+    assert!(wagglepost::asset_guard::verify_manifest(&dir).is_err(), "missing manifest fails");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wp12_touching_manifest_time_cannot_mask_content() {
+    // the 0700 gap: touching ASSETS.sha's mtime alone must not mask a stale bundle.
+    // The content digest check is mtime-independent: after touching the manifest, a
+    // replaced app.js STILL fails the content verification.
+    let dir = std::env::temp_dir().join(format!("wp12t-{}", wagglepost::ids::new_token()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("app.js"), "original").unwrap();
+    let digest = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(std::fs::read(dir.join("app.js")).unwrap());
+        hex::encode(h.finalize())
+    };
+    std::fs::write(dir.join("ASSETS.sha"), format!("{digest}  app.js\n")).unwrap();
+    // touch the manifest (bump mtime)
+    let md = std::fs::metadata(dir.join("ASSETS.sha")).unwrap();
+    let _ = md;
+    std::fs::write(dir.join("ASSETS.sha"), format!("{digest}  app.js\n")).unwrap();
+    // replace app.js WITHOUT updating the manifest → content mismatch detected
+    std::fs::write(dir.join("app.js"), "tampered").unwrap();
+    assert!(
+        wagglepost::asset_guard::verify_manifest(&dir).is_err(),
+        "touching the manifest time cannot mask a replaced app.js"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- 午后复审: WP09 CLI — explicit preview/confirm, black-box ----------
+
+fn write_cli_session(env: &TestEnv) {
+    let session = json!({"port": env.port, "token": env.token, "csrf": env.csrf});
+    std::fs::write(
+        env.managed_root.join("cli-session.json"),
+        session.to_string(),
+    )
+    .unwrap();
+}
+
+fn run_cli(env: &TestEnv, args: &[&str]) -> std::process::Output {
+    let exe = env!("CARGO_BIN_EXE_wagglepost");
+    std::process::Command::new(exe)
+        .args(args)
+        .env("WAGGLEPOST_MANAGED_ROOT", env.managed_root.to_string_lossy().as_ref())
+        .output()
+        .expect("spawn cli")
+}
+
+#[test]
+fn wp09_cli_answer_preview_then_confirm_black_box() {
+    let env = TestEnv::new();
+    write_cli_session(&env);
+    let (task_id, _) = env.ready_task(
+        "direct",
+        Some("fake"),
+        Some(json!({
+            "behaviors": ["write_files"],
+            "files": {"p.txt": "partial (simulated)\n"},
+            "result": {
+                "status": "needs_decision",
+                "question": "go?",
+                "options": [{"id": "opt_go", "label": "go", "effect": "g"}]
+            }
+        })),
+    );
+    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("cli-d1")).expect("dispatch");
+    let _ = env.run_until(&task_id, &["waiting_decision"], Duration::from_secs(60));
+    let exe = env!("CARGO_BIN_EXE_wagglepost");
+
+    // find the open decision
+    let decisions = env.req("GET", "/v1/decisions?status=open", None, None).unwrap();
+    let card = &decisions["decisions"].as_array().unwrap()[0];
+    let decision_id = card["decision_id"].as_str().unwrap().to_string();
+    // preview the body via HTTP (what the CLI prints)
+    let prev = env.req(
+        "GET",
+        &format!("/v1/tasks/{task_id}/handoff-preview?decision={decision_id}&option=opt_go"),
+        None,
+        None,
+    ).unwrap();
+    let real_digest = prev["approved_digest"].as_str().unwrap().to_string();
+
+    // step 1 (black-box): the REAL CLI binary without --digest → preview only,
+    // exit 0, NOTHING changes (no attempt, no budget, no queue)
+    let out = std::process::Command::new(exe)
+        .args(["answer", &decision_id, "opt_go"])
+        .env("WAGGLEPOST_MANAGED_ROOT", env.managed_root.to_string_lossy().as_ref())
+        .output()
+        .expect("spawn cli preview");
+    assert!(out.status.success(), "preview exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("relay body"), "preview prints the body");
+    assert!(stdout.contains("digest:"), "preview prints the digest");
+    assert!(stdout.contains("re-run with --digest"), "preview instructs the confirm step");
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    assert_eq!(snap["attempts"].as_array().unwrap().len(), 1, "preview does NOT launch");
+    assert_eq!(snap["task"]["resume_used"], json!(0), "preview does not consume budget");
+
+    // step 2 (black-box): the REAL CLI binary with --digest <wrong> → refused
+    let out = std::process::Command::new(exe)
+        .args(["answer", &decision_id, "opt_go", "--digest", "wrong-digest"])
+        .env("WAGGLEPOST_MANAGED_ROOT", env.managed_root.to_string_lossy().as_ref())
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !out.status.success(),
+        "wrong digest must be refused by the CLI"
+    );
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    assert_eq!(snap["attempts"].as_array().unwrap().len(), 1, "no launch on wrong digest");
+    assert_eq!(snap["task"]["resume_used"], json!(0), "no budget consumed");
+
+    // step 3 (black-box): the REAL CLI binary with --digest <correct> → queues once
+    let out = std::process::Command::new(exe)
+        .args(["answer", &decision_id, "opt_go", "--digest", &real_digest])
+        .env("WAGGLEPOST_MANAGED_ROOT", env.managed_root.to_string_lossy().as_ref())
+        .output()
+        .expect("spawn cli");
+    assert!(out.status.success(), "confirm with the correct digest queues");
+    let status = env.run_until(&task_id, &["needs_review", "interrupted"], Duration::from_secs(90));
+    assert_eq!(status, "needs_review", "exactly one resume launch");
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    assert_eq!(snap["attempts"].as_array().unwrap().len(), 2, "exactly 2 attempts total");
+    assert_eq!(snap["task"]["resume_used"], json!(1));
+}

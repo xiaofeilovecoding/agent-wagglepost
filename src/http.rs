@@ -56,7 +56,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/events", get(sse_events))
         .route("/v1/resume-options/{id}", get(resume_options))
         .route("/v1/__tick", post(tick))
-        .route("/v1/tasks/{id}/sample-script", post(sample_script))
         .with_state(state)
 }
 
@@ -341,6 +340,7 @@ fn parse_submit(body: &Value) -> Result<SubmitInput, CoreError> {
     Ok(SubmitInput {
         title: body.get("title").and_then(|t| t.as_str()).unwrap_or("").into(),
         resume_budget: body.get("resume_budget").and_then(|b| b.as_u64()),
+        demo: body.get("demo").and_then(|b| b.as_str()).map(|s| s.to_string()),
         goal,
         acceptance: arr("acceptance"),
         repo_path,
@@ -851,43 +851,6 @@ async fn resume_options(
         },
     }))
     .into_response()
-}
-
-/// Demo-sample script pinning: ONLY allowed for all-fake tasks created by the
-/// web sample buttons; rejects any task whose allowed adapters include a real runtime.
-async fn sample_script(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    let (bearer, cookie) = auth_context(&state, &headers);
-    if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
-        return r;
-    }
-    let Some(task) = state.core.store.get_task(&id) else {
-        return error_response(StatusCode::NOT_FOUND, "not_found", "task not found");
-    };
-    let all_fake = task
-        .allowed_adapters
-        .iter()
-        .all(|a| a == "fake");
-    if !all_fake {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "sample_scripts_fake_only",
-            "sample scripts can only pin all-simulated tasks",
-        );
-    }
-    let step = body.get("step").and_then(|s| s.as_str()).unwrap_or("s1").to_string();
-    let Some(script) = body.get("script") else {
-        return error_response(StatusCode::BAD_REQUEST, "script_required", "script is required");
-    };
-    state
-        .core
-        .store
-        .meta_set(&format!("fake_script:{}:{}", id, step), &script.to_string());
-    Json(json!({"pinned": true, "task": id, "step": step})).into_response()
 }
 
 async fn tick(State(state): State<SharedState>, headers: HeaderMap) -> Response {

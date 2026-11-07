@@ -1,44 +1,39 @@
-// Build-time guard (WP12): the embedded web bundle must never be stale. If the UI
-// sources are newer than the built dist, fail the build with an actionable message
-// instead of silently embedding an old bundle.
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
-fn newest_mtime(dir: &Path) -> Option<SystemTime> {
-    let mut newest: Option<SystemTime> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let meta = entry.metadata().ok()?;
-        let mtime = meta.modified().ok()?;
-        if newest.is_none() || mtime > newest.unwrap() {
-            newest = Some(mtime);
-        }
-        if meta.is_dir() {
-            if let Some(inner) = newest_mtime(&entry.path()) {
-                if inner > newest.unwrap() {
-                    newest = Some(inner);
-                }
-            }
-        }
-    }
-    newest
+#[path = "src/asset_guard.rs"]
+mod asset_guard;
+
+// Build-time guard (WP12): the embedded web bundle must never be stale or
+// tampered. Verifies (1) no build input newer than dist (stale), and (2) every
+// dist asset content digest matches ASSETS.sha (manifest).
+fn input_dirs() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("web/src"),
+        PathBuf::from("web/build.mjs"),
+        PathBuf::from("web/package.json"),
+        PathBuf::from("web/package-lock.json"),
+    ]
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=web/dist");
     println!("cargo:rerun-if-changed=web/src");
-    let dist_index = PathBuf::from("web/dist/index.html");
-    if !dist_index.exists() {
+    println!("cargo:rerun-if-changed=web/build.mjs");
+    println!("cargo:rerun-if-changed=web/package.json");
+    println!("cargo:rerun-if-changed=web/package-lock.json");
+    let dist = Path::new("web/dist");
+    if !dist.join("index.html").exists() {
         println!("cargo:warning=web/dist missing — the embedded UI will be a placeholder; run `npm run build` in web/ first");
         return;
     }
-    // staleness: any web/src file newer than the built bundle → fail closed
-    let dist_newest = newest_mtime(Path::new("web/dist"));
-    if let (Some(src_newest), Some(dist_mtime)) = (newest_mtime(Path::new("web/src")), dist_newest) {
-        if src_newest > dist_mtime {
-            panic!(
-                "web/dist is STALE (web/src changed after the last `npm run build`). \
-                 Run `npm run build` in web/ and rebuild — do not ship an old bundle."
-            );
-        }
+    // 1. staleness: any build input newer than the newest dist output fails
+    let inputs: Vec<PathBuf> = input_dirs().into_iter().filter(|p| p.exists()).collect();
+    if let Err(e) = asset_guard::check_inputs_fresh(&inputs, dist) {
+        panic!("web assets are STALE: {e}");
+    }
+    // 2. content: every asset digest must match ASSETS.sha (touching mtimes cannot
+    //    mask a content change; a replaced app.js fails here)
+    if let Err(e) = asset_guard::verify_manifest(dist) {
+        panic!("web assets MISMATCH: {e}");
     }
 }
