@@ -32,10 +32,22 @@ def gate(name, fn):
         print(f"FAIL {name}: {e}")
 
 
+def tick(page):
+    """Scheduler tick via the PAGE context: the session cookie + CSRF ride along."""
+    return page.evaluate(
+        """async () => {
+          const c = await (await fetch('/v1/session/csrf', {credentials:'same-origin'})).json();
+          const r = await fetch('/v1/__tick', {method:'POST', credentials:'same-origin',
+            headers:{'X-CSRF-Token': c.csrf}});
+          return r.status;
+        }"""
+    )
+
+
 def wait_task_status(page, statuses, timeout_s=90):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        page.request.post(f"{BASE}/v1/__tick", headers=auth_headers())
+        tick(page)
         status = page.evaluate(
             """async () => {
               const r = await fetch('/v1/tasks', {credentials:'same-origin'});
@@ -61,6 +73,14 @@ def main():
         ctx = browser.new_context(viewport={"width": 1440, "height": 900})
         page = ctx.new_page()
         page.on("pageerror", lambda e: PAGE_ERRORS.append(str(e)))
+        def net_log(r):
+            if "/v1/" in r.url and r.status >= 400:
+                try:
+                    body = r.text()[:150]
+                except Exception:
+                    body = "(no body)"
+                print(f"NET {r.status} {r.request.method} {r.url[-60:]} {body}")
+        page.on("response", net_log)
         page.on(
             "request",
             lambda r: EXTERNAL_REQUESTS.append(r.url)
@@ -82,47 +102,111 @@ def main():
             page.wait_for_selector(".empty")
             assert page.locator("#new-task-btn, .empty button.primary").count() >= 1
             assert page.locator("#sample-btn").count() >= 1
+            assert page.locator("#sample-btn-reroute").count() >= 1
 
         gate("g6_empty_state_actions", g2_empty_state_actions)
 
+        def server_status(page):
+            return page.evaluate(
+                """async () => {
+                  const r = await fetch('/v1/tasks', {credentials:'same-origin'});
+                  const j = await r.json();
+                  return j.tasks && j.tasks[0] ? j.tasks[0].status : '';
+                }"""
+            )
+
         def g3_sample_full_journey():
-            # sample task: fake writer+reviewer; the scheduler may outrun the UI,
-            # so drive the primary action through each state until accepted
+            # sample (decision resume): the UI two-step flow — pick an option, the
+            # exact body appears, confirm sends THAT digest. Server state drives waits;
+            # the visible-body assertion is the WP09 UI requirement.
             page.locator("#sample-btn").first.click()
             page.wait_for_selector(".detail .primary")
-            assert page.locator(".detail h2").inner_text() != ""
-
-            deadline = time.time() + 120
-            accepted = False
-            saw_running_or_review = False
+            saw_visible_body = False
+            deadline = time.time() + 180
             while time.time() < deadline:
-                page.request.post(f"{BASE}/v1/__tick", headers=auth_headers())
-                page.wait_for_timeout(400)
-                if page.locator(".detail .primary").count() == 0:
-                    continue
-                label = page.locator(".detail .primary").inner_text()
-                disabled = page.locator(".detail .primary").is_disabled()
-                if ("已接收" in label) or ("Accepted" in label):
-                    accepted = True
+                tick(page)
+                st = server_status(page)
+                if st == "accepted":
                     break
-                if ("运行" in label) or ("状态" in label) or disabled:
-                    saw_running_or_review = True
+                if st == "waiting_decision":
+                    if page.locator(".decision-options input[type=radio]").count() > 0:
+                        page.locator(".decision-options label").first.click()
+                        page.wait_for_timeout(300)
+                        # click the primary: FIRST click shows the exact body
+                        page.locator(".detail .primary").click()
+                        page.wait_for_timeout(600)
+                        # the pending preview body MUST be visible before confirm
+                        assert page.locator(".detail .diffbox").count() > 0, "confirm step must display the body first"
+                        text = page.locator(".detail .diffbox").first.inner_text()
+                        assert len(text) > 50, f"visible body too short: {len(text)}"
+                        saw_visible_body = True
+                        # confirm click sends the displayed digest
+                        page.locator(".detail .primary").click()
+                    page.wait_for_timeout(300)
                     continue
-                if ("接收候选" in label) or ("Accept candidate" in label):
-                    saw_running_or_review = True
-                    page.locator(".detail .primary").click()
-                    continue
-                # approve / dispatch states
-                page.locator(".detail .primary").click()
-            assert accepted, "task never reached accepted through the UI"
-            assert saw_running_or_review, "running/review states were never visible"
-
-            # receipt stamp bound to the collected candidate
+                if st in ("queued", "needs_review") and page.locator(".detail .primary").count() > 0:
+                    lbl = page.locator(".detail .primary").inner_text()
+                    if ("派发" in lbl) or ("Dispatch" in lbl) or ("接收候选" in lbl) or ("Accept candidate" in lbl):
+                        page.locator(".detail .primary").click()
+                page.wait_for_timeout(300)
+            assert saw_visible_body, "the two-step body preview was never shown"
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                st = server_status(page)
+                if st == "accepted":
+                    break
+                tick(page)
+                page.wait_for_timeout(300)
+            assert server_status(page) == "accepted", "task never reached accepted"
+            page.wait_for_timeout(500)
             assert page.locator(".route-receipt").count() > 0, "receipt stamp never shown"
             stamp = page.locator(".route-receipt code").inner_text()
             assert len(stamp) >= 6, f"receipt stamp readable: {stamp}"
 
         gate("g6_sample_full_journey", g3_sample_full_journey)
+
+        def g3b_reroute_sample_flow():
+            # reroute sample: quota block -> reroute panel TWO-STEP preview/confirm ->
+            # relay -> review -> accept. Return to the desk first (g3 left a task open).
+            page.locator(".nav button").nth(0).click()
+            page.wait_for_timeout(400)
+            page.locator("#sample-btn-reroute").first.click()
+            page.wait_for_selector(".detail .primary")
+            page.locator(".detail .primary").click()  # dispatch
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                tick(page)
+                st = server_status(page)
+                if st in ("quota_blocked", "interrupted"):
+                    break
+                page.wait_for_timeout(300)
+            # expand the reroute details, click the target to preview
+            # (wait for the UI snap to catch up with the server state first)
+            page.wait_for_selector("text=换轨候选", timeout=30000)
+            page.locator("summary", has_text="换轨候选").first.click()
+            page.wait_for_selector("button:has-text('预览并换轨')", timeout=30000)
+            page.locator("button", has_text="预览并换轨").first.click()
+            page.wait_for_selector(".reasons .diffbox", timeout=15000)
+            body_text = page.locator(".reasons .diffbox").first.inner_text()
+            assert len(body_text) > 50, "reroute preview body must be visible"
+            page.locator("button", has_text="确认发送此正文").first.click()
+            deadline = time.time() + 150
+            accepted = False
+            while time.time() < deadline:
+                tick(page)
+                st = server_status(page)
+                if st == "accepted":
+                    accepted = True
+                    break
+                if st in ("queued", "needs_review") and page.locator(".detail .primary").count() > 0:
+                    lbl = page.locator(".detail .primary").inner_text()
+                    if ("接收候选" in lbl) or ("Accept candidate" in lbl):
+                        page.locator(".detail .primary").click()
+                page.wait_for_timeout(300)
+            assert accepted, "reroute task never reached accepted through the UI"
+
+        gate("g6_reroute_sample_flow", g3b_reroute_sample_flow)
+
 
         def g4_five_second_orientation():
             # station badges show who is doing what; primary shows next step; status tag visible
@@ -211,6 +295,9 @@ def main():
         def g11_console_and_network():
             assert PAGE_ERRORS == [], f"page errors: {PAGE_ERRORS}"
             assert EXTERNAL_REQUESTS == [], f"external requests: {EXTERNAL_REQUESTS[:3]}"
+            # WP12: the SERVED bundle must be the current build (not a stale asset)
+            served = page.evaluate("fetch('/app.js').then(r => r.text())")
+            assert "确认发送此正文" in served or "Confirm this body" in served, "served app.js is STALE (missing the two-step confirm marker)"
 
         gate("g6_console_and_network", g11_console_and_network)
 

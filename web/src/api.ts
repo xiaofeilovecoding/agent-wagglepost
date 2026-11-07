@@ -58,9 +58,12 @@ export const api = {
   decisions: (open: boolean) => call("GET", `/v1/decisions?status=${open ? "open" : "all"}`),
   answer: (decision: string, option: string, revision: number, digest: string, idem: string) =>
     call("POST", `/v1/decisions/${decision}/answer`, { option_id: option, revision, handoff_digest: digest }, idem),
-  reroute: (id: string, target: string, idem: string) => call("POST", `/v1/tasks/${id}/reroute`, { target_adapter: target }, idem),
+  reroute: (id: string, target: string, digest: string, idem: string) =>
+    call("POST", `/v1/tasks/${id}/reroute`, { target_adapter: target, handoff_digest: digest }, idem),
   accept: (id: string, candidate: string, idem: string) => call("POST", `/v1/tasks/${id}/accept`, { candidate_hash: candidate }, idem),
   resumeOptions: (id: string) => call("GET", `/v1/resume-options/${id}`),
+  sampleScript: (id: string, step: string, script: unknown) =>
+    call("POST", `/v1/tasks/${id}/sample-script`, { step, script }),
   request: (id: string) => call("GET", `/v1/requests/${id}`),
 };
 

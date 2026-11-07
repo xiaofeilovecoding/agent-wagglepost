@@ -870,6 +870,14 @@ Sample repository for the offline wagglepost tour.
                 ));
             }
         }
+        // WP09 weekend: the reviewer step requires a frozen candidate — block it
+        // explicitly (fail closed) instead of failing deep in the worktree creation
+        if next_step.role == Role::Reviewer && self.store.current_candidate(task_id).is_none() {
+            return Err(CoreError::conflict(
+                "review_candidate_required",
+                "the writer has not frozen a candidate to review; the reviewer step cannot dispatch",
+            ));
+        }
         // WP09 weekend: resume/reroute bodies are bound per generation at approval;
         // reviewer bodies are bound at freeze. A mismatch refuses before launch.
         if next_step.role == Role::Writer && generation > 1 {

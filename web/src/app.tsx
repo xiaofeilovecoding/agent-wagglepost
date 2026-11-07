@@ -345,7 +345,7 @@ function App() {
           <span>{t("brand", lang)}</span>
         </div>
         <nav className="nav" aria-label="main">
-          <button data-nav="desk" aria-pressed={nav === "desk"} onClick={() => setNav("desk")}>{t("desk", lang)}</button>
+          <button data-nav="desk" aria-pressed={nav === "desk"} onClick={() => { setNav("desk"); setSelected(null); setSnap(null); }}>{t("desk", lang)}</button>
           <button data-nav="tools" aria-pressed={nav === "tools"} onClick={() => setNav("tools")}>{t("tools", lang)}</button>
           <button data-nav="history" aria-pressed={nav === "history"} onClick={() => setNav("history")}>{t("history", lang)}</button>
         </nav>
@@ -478,12 +478,16 @@ function DeskEmpty({ lang, tasks, inbox, onSelect, showToast }: { lang: Lang; ta
         <div className="empty">
           <p>{t("emptyDesk", lang)}</p>
           <button id="new-task-btn" className="primary" style={{ maxWidth: 280 }} onClick={() => onSelect("__new__")}>{t("newTask", lang)}</button>
-          <SampleButton lang={lang} onDone={onSelect} onError={(m) => showToast(m)} />
+          <div className="row" style={{ justifyContent: "center", flexWrap: "wrap" }}>
+            <SampleButton lang={lang} kind="decision" onDone={onSelect} onError={(m) => showToast(m)} />
+            <SampleButton lang={lang} kind="reroute" onDone={onSelect} onError={(m) => showToast(m)} />
+          </div>
         </div>
       ) : (
         <div className="lineup tasklist">
-          <div className="row" style={{ marginBottom: 6 }}>
-            <SampleButton lang={lang} onDone={onSelect} onError={(m) => showToast(m)} />
+          <div className="row" style={{ marginBottom: 6, flexWrap: "wrap" }}>
+            <SampleButton lang={lang} kind="decision" onDone={onSelect} onError={(m) => showToast(m)} />
+            <SampleButton lang={lang} kind="reroute" onDone={onSelect} onError={(m) => showToast(m)} />
           </div>
           {list.map((task) => (
             <button key={task.task_id} className="taskrow" onClick={() => onSelect(task.task_id)}>
@@ -504,30 +508,59 @@ function DeskEmpty({ lang, tasks, inbox, onSelect, showToast }: { lang: Lang; ta
   );
 }
 
-function SampleButton({ lang, onDone, onError }: { lang: Lang; onDone: (id: string) => void; onError?: (m: string) => void }) {
+function SampleButton({ lang, onDone, onError, kind }: { lang: Lang; onDone: (id: string) => void; onError?: (m: string) => void; kind: "decision" | "reroute" }) {
   const [busy, setBusy] = useState(false);
+  const scripts: Record<string, any> = {
+    decision: {
+      gen1: {
+        behaviors: ["write_files"],
+        files: { "README.md": "# demo\n\nSample repository for the offline wagglepost tour.\npartial work (simulated)\n" },
+        result: {
+          status: "needs_decision",
+          question: lang === "zh" ? "保留已写内容并继续吗？" : "Keep the partial work and continue?",
+          options: [{ id: "opt_go", label: lang === "zh" ? "保留并继续" : "Keep and continue", effect: lang === "zh" ? "从检查点续跑" : "Resume from the checkpoint" }],
+        },
+      },
+    },
+    reroute: {
+      gen1: {
+        behaviors: ["write_files", "quota_block"],
+        files: { "README.md": "# demo\n\nSample repository for the offline wagglepost tour.\nquota-blocked partial work (simulated)\n" },
+      },
+    },
+  };
+  const submitSample = async () => {
+    const r = await api.submit(
+      {
+        goal: kind === "decision"
+          ? (lang === "zh" ? "在 README.md 末尾追加样例行。此样例演示：中断决策 → 预览正文 → 确认续答 → 复核接收（模拟）。" : "Append a sample line to README.md. Demonstrates: interruption decision -> preview body -> confirm resume -> review & accept (simulated).")
+          : (lang === "zh" ? "在 README.md 末尾追加样例行。此样例演示：额度阻塞 → 保留成果 → 预览正文 → 确认换轨 → 复核接收（模拟）。" : "Append a sample line to README.md. Demonstrates: quota block -> keep changes -> preview body -> confirm reroute -> review & accept (simulated)."),
+        repo_path: "sample:demo",
+        recipe: "write_then_review",
+        allowed_adapters: ["fake"],
+        acceptance: [lang === "zh" ? "样例任务完整走完（模拟）" : "Sample task completes (simulated)"],
+        ...(kind === "reroute" ? { resume_budget: 3 } : {}),
+      },
+      randomIdem("sample"),
+    );
+    const id = r.task.task_id;
+    await api.trust(id);
+    const p = await api.plan(id);
+    await api.approve(id, p.plan.summary_hash);
+    return id;
+  };
   return (
     <button
-      id="sample-btn"
+      id={kind === "decision" ? "sample-btn" : "sample-btn-reroute"}
       className="tag"
       disabled={busy}
       onClick={async () => {
         setBusy(true);
         try {
-          const r = await api.submit(
-            {
-              goal: "在 README.md 末尾追加一行「蜂递样例任务（模拟）」。这是离线样例，全部由模拟运行时执行。",
-              repo_path: "sample:demo",
-              recipe: "write_then_review",
-              allowed_adapters: ["fake"],
-              acceptance: ["样例任务完整走完（模拟）"],
-            },
-            randomIdem("sample")
-          );
-          const id = r.task.task_id;
-          await api.trust(id);
-          const p = await api.plan(id);
-          await api.approve(id, p.plan.summary_hash);
+          const id = await submitSample();
+          // pin the gen-1 fake script for this task (server-side demo script)
+          const script = scripts[kind].gen1;
+          await api.sampleScript(id, "s1", script);
           onDone(id);
         } catch (e) {
           const msg = e instanceof ApiError ? `${e.code}: ${e.message}` : String(e);
@@ -537,7 +570,9 @@ function SampleButton({ lang, onDone, onError }: { lang: Lang; onDone: (id: stri
         }
       }}
     >
-      {t("trySample", lang)}
+      {kind === "decision"
+        ? (lang === "zh" ? "试用样例 · 决策续答" : "Sample · decision resume")
+        : (lang === "zh" ? "试用样例 · 额度换轨" : "Sample · quota reroute")}
     </button>
   );
 }
@@ -631,6 +666,7 @@ function TaskView({
   selectTask,
   onReceipt,
 }: any) {
+  const [resumePreview, setResumePreview] = useState<{ digest: string; text: string; bytes: number; decisionId: string; optionId: string } | null>(null);
   const [handoff, setHandoff] = useState<any>(null);
   const [diff, setDiff] = useState<any>(null);
   const [showDiff, setShowDiff] = useState(false);
@@ -689,16 +725,29 @@ function TaskView({
         const r = await api.dispatch(task.task_id, randomIdem("web-disp"));
         showToast(`${t("dispatched", lang)} · ${r.receipt?.attempt_id ?? ""}`);
       } else if (status === "waiting_decision" && decision && decisionChoice) {
-        // WP09: the resume body must be previewed (with the chosen option applied)
-        // and its digest approved before queueing
-        const prev = await api.handoffPreview(task.task_id, "writer", decision.decision_id, decisionChoice);
+        // WP09 two-step: the FIRST click on an option shows the exact body; only the
+        // confirm click on a FRESH preview submits the digest. Option/task changes
+        // revoke the pending preview.
+        if (!resumePreview || resumePreview.decisionId !== decision.decision_id || resumePreview.optionId !== decisionChoice) {
+          const prev = await api.handoffPreview(task.task_id, "writer", decision.decision_id, decisionChoice);
+          setResumePreview({
+            digest: prev.approved_digest,
+            text: prev.handoff.text,
+            bytes: prev.handoff.bytes,
+            decisionId: decision.decision_id,
+            optionId: decisionChoice,
+          });
+          setBusy(false);
+          return;
+        }
         const r = await api.answer(
           decision.decision_id,
           decisionChoice,
           task.revision,
-          prev.approved_digest,
+          resumePreview.digest,
           randomIdem("web-ans"),
         );
+        setResumePreview(null);
         showToast(t("decisionQueued", lang));
       } else if (next === "reconcile") {
         const info = await api.request(attempts[attempts.length - 1]?.request_id || task.task_id);
@@ -721,7 +770,11 @@ function TaskView({
   const primaryLabel = (() => {
     if (status === "awaiting_approval") return t("approvePlan", langBtns);
     if (next === "dispatch") return t("confirmDispatch", langBtns);
-    if (status === "waiting_decision") return t("answerDecision", langBtns);
+    if (status === "waiting_decision") {
+      return resumePreview && decision && resumePreview.decisionId === decision.decision_id && resumePreview.optionId === decisionChoice
+        ? (lang === "zh" ? "确认发送此正文" : "Confirm this body")
+        : t("answerDecision", langBtns);
+    }
     if (next === "reconcile") return t("checkOriginalRequest", langBtns);
     if (phase === 1) return t("confirmReroute", langBtns);
     if (status === "needs_review") return currentCand ? t("acceptCandidate", langBtns) : t("viewCandidate", lang);
@@ -789,8 +842,7 @@ function TaskView({
                   key={s.step_id}
                   className="station"
                   onClick={async () => {
-                    const r = await api.routePreview(task.task_id, s.role).catch(() => null);
-                    if (r) setRoute(r);
+                    await api.routePreview(task.task_id, s.role).catch(() => null);
                   }}
                   aria-pressed={false}
                 >
@@ -837,6 +889,17 @@ function TaskView({
               <li key={i}>{f}</li>
             ))}
           </ul>
+          {resumePreview && status === "waiting_decision" && (
+            <details open>
+              <summary>
+                {lang === "zh" ? "待发送正文预览" : "Body to be sent"} — {resumePreview.bytes} {t("bytes", lang)}
+              </summary>
+              <div className="diffbox">{resumePreview.text}</div>
+              <p className="muted" style={{ fontSize: 12 }}>
+                digest: <code>{resumePreview.digest}</code>
+              </p>
+            </details>
+          )}
           {decision && (
             <fieldset className="decision-options">
               <legend>{t("chooseOption", lang)}</legend>
@@ -949,6 +1012,9 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
   const [resume, setResume] = useState<any>(null);
   const [handoff, setHandoff] = useState<any>(null);
   const [targets, setTargets] = useState<any[]>([]);
+  // WP11: per-target two-step confirm — click shows the exact body; the confirm
+  // click submits THAT digest; changing target clears the pending confirmation
+  const [pending, setPending] = useState<{ target: string; digest: string } | null>(null);
   useEffect(() => {
     api.resumeOptions(task.task_id).then(setResume).catch(() => {});
     api.routePreview(task.task_id, "writer").then((r) => setTargets(r.candidates || [])).catch(() => {});
@@ -977,7 +1043,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
         </p>
       )}
       {handoff && (
-        <details>
+        <details open={!!pending}>
           <summary>
             {t("sendBody", lang)} — {handoff.handoff.bytes} {t("bytes", lang)}
           </summary>
@@ -993,10 +1059,21 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
                 className="tag"
                 disabled={busy || !c.ok}
                 onClick={async () => {
+                  if (!pending || pending.target !== c.adapter) {
+                    // first click: show the exact body for THIS target
+                    const prev = await api.handoffPreview(task.task_id, "writer").catch(() => null);
+                    if (prev) {
+                      setPending({ target: c.adapter, digest: prev.approved_digest });
+                      setHandoff(prev);
+                    }
+                    setBusy(false);
+                    return;
+                  }
                   setBusy(true);
                   try {
-                    await api.reroute(task.task_id, c.adapter, randomIdem("web-rr"));
+                    await api.reroute(task.task_id, c.adapter, pending.digest, randomIdem("web-rr"));
                     showToast(lang === "zh" ? "换轨已排队" : "Reroute queued");
+                    setPending(null);
                     await refreshTask(task.task_id);
                     refreshTasks();
                   } catch (e) {
@@ -1006,7 +1083,9 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
                   }
                 }}
               >
-                {c.adapter} → {lang === "zh" ? "确认换轨" : "Confirm reroute"}
+                {pending && pending.target === c.adapter
+                  ? `${c.adapter} → ${lang === "zh" ? "确认发送此正文" : "Confirm this body"}`
+                  : `${c.adapter} → ${lang === "zh" ? "预览并换轨" : "Preview and reroute"}`}
               </button>{" "}
               {!c.ok && (
                 <span className="muted">
@@ -1024,36 +1103,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
           </p>
         )}
       </details>
-      {["interrupted", "cancelled", "quota_blocked"].includes(task.status) && (
-        <button
-          className="tag"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            try {
-              // attempt a reroute to each real candidate in priority order; surface the refusal honestly
-              let lastErr: any = null;
-              for (const c of targets.filter((x) => !x.simulated)) {
-                try {
-                  await api.reroute(task.task_id, c.adapter, randomIdem("web-rr"));
-                  showToast(lang === "zh" ? "换轨已排队" : "Reroute queued");
-                  lastErr = null;
-                  break;
-                } catch (e) {
-                  lastErr = e;
-                }
-              }
-              if (lastErr) showToast(lastErr instanceof ApiError ? `${lastErr.code}: ${lastErr.message}` : String(lastErr));
-              await refreshTask(task.task_id);
-              refreshTasks();
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {t("confirmReroute", lang)}
-        </button>
-      )}
+
     </div>
   );
 }
