@@ -38,11 +38,14 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Unit and integration tests (locked)
-        run: cargo test --locked --release -- --test-threads=2
+      - name: Fetch locked crates for offline test/build
+        run: cargo fetch --locked
 
-      - name: Build production binary (locked)
-        run: cargo build --locked --release
+      - name: Offline unit and integration tests (locked)
+        run: cargo test --offline --locked --release -- --test-threads=2
+
+      - name: Offline production build (locked)
+        run: cargo build --offline --locked --release
 
       - name: Set up Python for Playwright
         uses: actions/setup-python@v5
