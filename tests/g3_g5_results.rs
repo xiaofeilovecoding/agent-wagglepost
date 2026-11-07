@@ -95,8 +95,10 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
 #[test]
 fn g5_candidate_binding_review_and_accept() {
     let env = TestEnv::new();
-    // candidate A: writer A done → reviewer flags issues → manual reroute builds candidate B
-    let (task_id, _) = env.ready_task(
+    // candidate A: writer A done → reviewer flags issues → manual reroute builds candidate B.
+    // WP10: the reroute must fit the approved budget (writer + review re-run = 2 more
+    // launches), so this task plans an explicit resume_budget of 3 at submission.
+    let (task_id, _) = env.ready_task_with_budget(
         "write_then_review",
         Some("fake"),
         Some(json!({
@@ -105,6 +107,7 @@ fn g5_candidate_binding_review_and_accept() {
 "},
             "result": {"status": "done", "summary": "done (simulated)"}
         })),
+        3,
     );
     // reviewer flags issues (set before dispatch so the chained review uses it)
     env.set_fake_script(

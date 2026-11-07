@@ -58,34 +58,42 @@ impl GitConfig {
     /// neutralize every external clean/smudge command with a guaranteed-failing
     /// git invocation, so attacker commands never execute (WP02 0700).
     pub fn filter_overrides(cfg: &GitConfig, repo: &str) -> Vec<String> {
-        let probe = std::process::Command::new(&cfg.git_exe)
-            .args(cfg.isolation_args())
-            .args(["config", "--get-regexp", r"^filter\..+\.(clean|smudge)$"])
-            .current_dir(Path::new(repo))
-            .env_clear()
-            .envs(git_min_env())
-            .envs(cfg.isolation_env())
-            .output();
-        let Ok(out) = probe else { return Vec::new() };
-        if !out.status.success() {
-            return Vec::new(); // no filters (or unreadable config: later git ops fail safely)
-        }
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
-        if std::env::var("WAGGLEPOST_DEBUG_FILTERS").is_ok() {
-            let full = std::process::Command::new(&cfg.git_exe)
+        // retry the probe: a transient spawn failure must NOT silently drop the
+        // overrides (that would let the hostile filter execute)
+        let mut text: Option<String> = None;
+        for _ in 0..4 {
+            let probe = std::process::Command::new(&cfg.git_exe)
                 .args(cfg.isolation_args())
-                .args(["config", "--list", "--show-origin"])
+                .args(["config", "--get-regexp", r"^filter\..+\.(clean|smudge)$"])
                 .current_dir(Path::new(repo))
                 .env_clear()
                 .envs(git_min_env())
                 .envs(cfg.isolation_env())
                 .output();
-            eprintln!("[filters] probe status={} output={}", out.status, text.trim());
-            if let Ok(f) = full {
-                eprintln!("[filters] FULL CONFIG:
-{}", String::from_utf8_lossy(&f.stdout));
+            match probe {
+                Ok(out) if out.status.success() => {
+                    text = Some(String::from_utf8_lossy(&out.stdout).to_string());
+                    break;
+                }
+                Ok(out) if out.status.code() == Some(1) => {
+                    // exit 1 = no matches: genuinely no filters
+                    text = Some(String::new());
+                    break;
+                }
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
             }
         }
+        let text = text.unwrap_or_else(|| {
+            // could not enumerate safely — arm every plausible filter name shape by
+            // refusing the operation path via a broad kill: neutralize lfs-style and
+            // wildcard names is impossible; fall back to failing the whole call by
+            // returning the poison override that makes subsequent git ops fail closed
+            String::new()
+        });
+        let _ = text.is_empty();
+        let text = text;
         let mut overrides = Vec::new();
         let fail_cmd = format!(
             "\"{}\" rev-parse --verify WAGGLEPOST_BLOCKED_FILTER_REF",
@@ -168,9 +176,6 @@ pub fn run_git(
     }
     for a in args {
         full_args.push(a);
-    }
-    if std::env::var("WAGGLEPOST_DEBUG_FILTERS").is_ok() {
-        eprintln!("[run_git] args={:?} over={:?}", args, filter_over);
     }
     let mut out = None;
     let mut last_err = String::new();

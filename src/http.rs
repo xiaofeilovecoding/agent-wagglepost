@@ -339,6 +339,7 @@ fn parse_submit(body: &Value) -> Result<SubmitInput, CoreError> {
     };
     Ok(SubmitInput {
         title: body.get("title").and_then(|t| t.as_str()).unwrap_or("").into(),
+        resume_budget: body.get("resume_budget").and_then(|b| b.as_u64()),
         goal,
         acceptance: arr("acceptance"),
         repo_path,

@@ -166,6 +166,8 @@ impl From<String> for CoreError {
 
 pub struct SubmitInput {
     pub title: String,
+    /// explicitly approved resume budget at submission time (WP10), default 1
+    pub resume_budget: Option<u64>,
     pub goal: String,
     pub acceptance: Vec<String>,
     pub repo_path: String,
@@ -387,7 +389,7 @@ Sample repository for the offline wagglepost tour.
             recipe: input.recipe,
             status: TaskStatus::AwaitingApproval,
             planned_steps: if input.recipe == Recipe::WriteThenReview { 2 } else { 1 },
-            resume_budget: 1,
+            resume_budget: input.resume_budget.unwrap_or(1).clamp(1, 8),
             resume_used: 0,
             launches_used: 0,
             allowed_adapters: if input.allowed_adapters.is_empty() {
@@ -1859,8 +1861,23 @@ failure_location: cp
                 format!("{target_adapter} has not passed the independent write-capability gate; export the patch and hand off manually"),
             ));
         }
-        if task.budget_remaining() <= 0 {
-            return Err(CoreError::conflict("budget_exhausted", "resume budget exhausted"));
+        // WP10: disclose the FULL relay cost before any launch — the relay writer
+        // plus, for write_then_review, its paired reviewer re-run.
+        let needs_reviewer = self
+            .store
+            .latest_plan(task_id)
+            .map(|p| p.recipe == Recipe::WriteThenReview)
+            .unwrap_or(false);
+        let needed = 1 + u64::from(needs_reviewer);
+        let remaining = task.budget_remaining();
+        if remaining < needed as i64 {
+            return Err(CoreError::conflict(
+                "budget_exhausted",
+                format!(
+                    "reroute needs {needed} launch(es) (writer{}), but only {remaining} remain in the approved budget; increase the budget explicitly and try again",
+                    if needs_reviewer { " + review re-run" } else { "" }
+                ),
+            ));
         }
         if !self.repo_trusted(&task.repo_path) {
             return Err(CoreError::conflict("repo_untrusted", "repository is not trusted"));

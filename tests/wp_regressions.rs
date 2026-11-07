@@ -495,11 +495,10 @@ fn wp02b_included_filter_neutralized_and_reverified_at_dispatch() {
     println!("[m1] after include.path: {}", marker.exists());
     std::fs::write(env.user_repo.join(".gitattributes"), "*.txt filter=waggleproof\n").unwrap();
     println!("[m2] after attrs write: {}", marker.exists());
-    common::git(&env.user_repo, &["add", "-A"]);
-    println!("[m3] after add -A: {}", marker.exists());
     // the test's own staging also runs through isolated git (hostile filter active)
     common::git(&env.user_repo, &["-c", "filter.waggleproof.clean=exit 1", "-c", "filter.waggleproof.smudge=exit 1", "add", "-A"]);
-    println!("[m3b] after isolated add: {}", marker.exists());
+    common::git(&env.user_repo, &["-c", "filter.waggleproof.clean=exit 1", "-c", "filter.waggleproof.smudge=exit 1", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "attrs"]);
+    println!("[m3] after isolated staging: {}", marker.exists());
     // the plain-git setup add ran the filter once (no isolation in the test harness);
     // from here on the PRODUCT runs — it must never execute the filter again
     let _ = std::fs::remove_file(&marker);
@@ -536,6 +535,9 @@ fn wp02b_included_filter_neutralized_and_reverified_at_dispatch() {
     );
     common::git(&env.user_repo, &["config", "-f", include2.to_string_lossy().as_ref(), "filter.late.clean", &clean_cmd2]);
     common::git(&env.user_repo, &["config", "--local", "include.path", include2.to_string_lossy().as_ref()]);
+    // stage the new config file through isolated git (untracked files make the repo dirty)
+    common::git(&env.user_repo, &["-c", "filter.late.clean=exit 1", "-c", "filter.late.smudge=exit 1", "add", "-A"]);
+    common::git(&env.user_repo, &["-c", "filter.late.clean=exit 1", "-c", "filter.late.smudge=exit 1", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "late attrs"]);
     let (t2, _) = env.ready_task(
         "direct",
         Some("fake"),
@@ -683,14 +685,31 @@ fn wp10_reroute_budget_disclosure_and_no_extra_launch() {
             "result": {"status": "done", "summary": "done (simulated)"}
         })),
     );
+    // the review must find issues so the reroute is ELIGIBLE (then the budget check fires)
+    env.set_fake_script(&task_id, "s2", &json!({
+        "behaviors": [],
+        "result": {"status": "done", "summary": "review found issues: budget probe (simulated)"}
+    }));
     env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp10-1")).expect("dispatch");
     let _ = env.run_until(&task_id, &["needs_review"], Duration::from_secs(60));
+    let start = std::time::Instant::now();
+    loop {
+        let _ = env.req("POST", "/v1/__tick", Some(&json!({})), None);
+        let s = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+        if !s["reviews"].as_array().unwrap().is_empty() { break; }
+        assert!(start.elapsed() < Duration::from_secs(60), "review never recorded");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let dbg = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    assert_eq!(dbg["reviews"][0]["verdict"], json!("issues"), "issues verdict needed for eligibility");
+    println!("[w10] status={} launches={}", dbg["task"]["status"], dbg["task"]["launches_used"]);
     let err = env.req(
         "POST",
         &format!("/v1/tasks/{task_id}/reroute"),
         Some(&json!({"target_adapter": "fake"})),
         Some("wp10-rr"),
     ).unwrap_err();
+    println!("[w10] reroute error: {}", err.1["error"]);
     assert_eq!(err.1["error"]["code"], json!("budget_exhausted"));
     let msg = err.1["error"]["message"].as_str().unwrap().to_string();
     assert!(msg.contains('2'), "disclosure names the required launch count: {msg}");
@@ -707,6 +726,10 @@ fn wp10_reroute_budget_disclosure_and_no_extra_launch() {
         })),
         4,
     );
+    env.set_fake_script(&t2, "s2", &json!({
+        "behaviors": [],
+        "result": {"status": "done", "summary": "review found issues: budget probe 2 (simulated)"}
+    }));
     env.req("POST", &format!("/v1/tasks/{t2}/dispatch"), Some(&json!({})), Some("wp10-2")).expect("dispatch");
     let _ = env.run_until(&t2, &["needs_review"], Duration::from_secs(60));
     let start = std::time::Instant::now();
