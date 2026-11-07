@@ -91,19 +91,17 @@ fn g4_hang_cancel_confirms_process_tree_exit() {
     .unwrap();
     // wait until running
     let start = std::time::Instant::now();
-    let mut attempt_id = String::new();
-    loop {
+    let attempt_id = loop {
         let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
         let attempts = snap["attempts"].as_array().unwrap();
         if attempts.len() == 1 && attempts[0]["status"] == json!("running") {
-            attempt_id = attempts[0]["attempt_id"].as_str().unwrap().to_string();
-            break;
+            break attempts[0]["attempt_id"].as_str().unwrap().to_string();
         }
         if start.elapsed() > Duration::from_secs(30) {
             panic!("attempt never started running");
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
     // cancel → stopping → cancelled with confirmed exit
     env.req(
         "POST",

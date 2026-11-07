@@ -12,7 +12,7 @@ fn wp02c_textconv_disabled_in_collection_and_preview() {
     let env = TestEnv::new();
     let marker = env.managed_root.parent().unwrap().join("textconv-marker");
     let _ = std::fs::remove_file(&marker);
-    let exe = env!("CARGO_BIN_EXE_wagglepost").replace('\\', "/");
+    let _exe = env!("CARGO_BIN_EXE_wagglepost").replace('\\', "/");
     // diff.<driver>.textconv writes the marker and emits the raw content
     let conv_cmd = format!(
         "echo executed > \"{}\"; cat",
@@ -544,7 +544,7 @@ fn wp12_verify(skel: &Wp12Skel) -> Result<(), String> {
 }
 
 fn wp12_set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
-    let mut f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
     f.set_modified(t).unwrap();
 }
 

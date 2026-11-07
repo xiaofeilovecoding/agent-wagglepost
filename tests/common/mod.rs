@@ -89,15 +89,15 @@ impl TestEnv {
                 let _ = axum::serve(listener, app).await;
             });
         });
-        let SC = format!("code-{}", &new_token()[..8]);
-        core.store.meta_set("startup_code", &SC);
+        let startup_code = format!("code-{}", &new_token()[..8]);
+        core.store.meta_set("startup_code", &startup_code);
         // the in-process server IS a real instance: hold the managed-root lock (WP06)
         let lock = wagglepost::instance_lock::acquire(&managed).expect("instance lock");
         Arc::new(TestEnv {
             port,
             token: "test-token".into(),
             csrf: "test-csrf".into(),
-            startup_code_value: SC.clone(),
+            startup_code_value: startup_code.clone(),
             core,
             managed_root: managed,
             user_repo,

@@ -75,7 +75,7 @@ fn wp01_startup_code_single_consumption() {
         let base = base.clone();
         let code = code.clone();
         handles.push(std::thread::spawn(move || {
-            let mut r = ureq::post(&format!("{base}/v1/session"))
+            let r = ureq::post(&format!("{base}/v1/session"))
                 .timeout(Duration::from_secs(30))
                 .set("Origin", &base)
                 .set("Host", &base.trim_start_matches("http://"));
@@ -507,8 +507,8 @@ fn wp02b_included_filter_repo_refused_fail_closed() {
     common::git(&env.user_repo, &["config", "--local", "--unset-all", "include.path"]);
     // the uncommitted .gitattributes + late config make the repo dirty → explicit base
     let head = common::git(&env.user_repo, &["rev-parse", "HEAD"]);
-    let (t2, head_hash) = (String::new(), head.trim().to_string());
-    let mut body2 = json!({
+    let (_t2, head_hash) = (String::new(), head.trim().to_string());
+    let body2 = json!({
         "goal": "append one demo line to lib.txt (offline simulated)",
         "repo_path": env.user_repo.to_string_lossy(),
         "recipe": "direct",

@@ -94,7 +94,7 @@ fn g7a_relay_package_is_minimal_and_bounded() {
     .unwrap();
     let _ = env.run_until(&task_id, &["waiting_decision"], Duration::from_secs(60));
     let decisions = env.req("GET", "/v1/decisions?status=open", None, None).unwrap();
-    let card = &decisions["decisions"].as_array().unwrap()[0];
+    let _card = &decisions["decisions"].as_array().unwrap()[0];
     env.answer_card(&task_id, "opt_go", "rp-ans");
 
     // relay package preview: contains progress + failure + next step; no chat history
