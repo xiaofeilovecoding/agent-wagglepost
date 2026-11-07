@@ -17,11 +17,13 @@ export class ApiError extends Error {
   }
 }
 
-async function call(method: string, path: string, body?: unknown, idem?: string): Promise<any> {
+async function call(method: string, path: string, body?: unknown, idem?: string, ifMatch?: number): Promise<any> {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && CSRF) headers["X-CSRF-Token"] = CSRF;
   if (idem) headers["Idempotency-Key"] = idem;
+  // optimistic concurrency: the exact task revision the user is looking at
+  if (ifMatch !== undefined) headers["If-Match"] = `"${ifMatch}"`;
   const resp = await fetch(path, {
     method,
     headers,
@@ -44,7 +46,8 @@ export const api = {
   submit: (body: any, idem: string) => call("POST", "/v1/tasks", body, idem),
   trust: (id: string) => call("POST", `/v1/tasks/${id}/trust`, {}),
   plan: (id: string, writer?: string) => call("POST", `/v1/tasks/${id}/plan`, writer ? { writer_adapter: writer } : {}),
-  approve: (id: string, hash: string) => call("POST", `/v1/tasks/${id}/plan/approve`, { summary_hash: hash }),
+  approve: (id: string, hash: string, revision: number, digest: string, idem: string) =>
+    call("POST", `/v1/tasks/${id}/plan/approve`, { summary_hash: hash, handoff_digest: digest }, idem, revision),
   routePreview: (id: string, role: string) => call("GET", `/v1/tasks/${id}/route-preview?role=${role}`),
   dispatch: (id: string, idem: string) => call("POST", `/v1/tasks/${id}/dispatch`, {}, idem),
   handoffPreview: (id: string, role: string, decision?: string, option?: string) =>
@@ -58,8 +61,8 @@ export const api = {
   decisions: (open: boolean) => call("GET", `/v1/decisions?status=${open ? "open" : "all"}`),
   answer: (decision: string, option: string, revision: number, digest: string, idem: string) =>
     call("POST", `/v1/decisions/${decision}/answer`, { option_id: option, revision, handoff_digest: digest }, idem),
-  reroute: (id: string, target: string, digest: string, idem: string) =>
-    call("POST", `/v1/tasks/${id}/reroute`, { target_adapter: target, handoff_digest: digest }, idem),
+  reroute: (id: string, target: string, digest: string, revision: number, idem: string) =>
+    call("POST", `/v1/tasks/${id}/reroute`, { target_adapter: target, handoff_digest: digest }, idem, revision),
   accept: (id: string, candidate: string, idem: string) => call("POST", `/v1/tasks/${id}/accept`, { candidate_hash: candidate }, idem),
   resumeOptions: (id: string) => call("GET", `/v1/resume-options/${id}`),
   request: (id: string) => call("GET", `/v1/requests/${id}`),

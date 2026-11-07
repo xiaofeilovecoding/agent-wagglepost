@@ -29,6 +29,26 @@ pub struct AppState {
 
 type SharedState = Arc<AppState>;
 
+/// WP14/WP15: `If-Match: "<revision>"` is the optimistic-concurrency binding for
+/// mutating task actions. Missing is returned as None so core can emit the stable
+/// `revision_required` code; malformed values are refused without touching state.
+fn if_match_revision(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+    let Some(raw) = headers.get("if-match") else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().unwrap_or("").trim().trim_matches('"');
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u64>().map(Some).map_err(|_| {
+        error_response(
+            StatusCode::CONFLICT,
+            "revision_mismatch",
+            "If-Match must be the numeric task revision",
+        )
+    })
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/health", get(health))
@@ -422,12 +442,50 @@ async fn approve_plan(
         .unwrap_or("")
         .to_string();
     let handoff_digest = body.get("handoff_digest").and_then(|h| h.as_str());
-    match state.core.approve_plan(&id, &hash, handoff_digest) {
+    let revision = match if_match_revision(&headers) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    // Approval is a write request: the client saves this key before sending and
+    // replays it after a lost response. A same-key replay returns the original
+    // receipt without a second plan_approved event; a new key cannot re-approve.
+    let request_id = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| body.get("request_id").and_then(|r| r.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    if request_id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "request_id_required",
+            "approval needs an Idempotency-Key (save it before sending)",
+        );
+    }
+    let digest = canonical_digest(&json!({
+        "op": "approve", "task": id, "summary_hash": hash,
+        "revision": revision, "handoff": handoff_digest
+    }));
+    let rec = match state.core.begin_request(&request_id, "approve", Some(&id), digest) {
+        Ok(r) => r,
+        Err(e) => return core_error_response(&e),
+    };
+    if rec.status == "completed" {
+        return Json(rec.result).into_response();
+    }
+    match state.core.approve_plan(&id, &hash, handoff_digest, revision) {
         Ok(t) => {
             let receipt = routing::build_receipt("approve", &t, None, false);
-            Json(json!({"task": t, "receipt": receipt})).into_response()
+            let result = json!({"task": t, "receipt": receipt});
+            state.core.finish_request(rec, result.clone(), None);
+            Json(result).into_response()
         }
-        Err(e) => core_error_response(&e),
+        Err(e) => {
+            // validation/state refusal created no task mutation: drop the key so a
+            // corrected request can use a fresh transaction instead of a stuck one
+            state.core.store.delete_request(&request_id);
+            core_error_response(&e)
+        }
     }
 }
 
@@ -675,15 +733,8 @@ async fn reroute(
     if request_id.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "request_id_required", "reroute needs an Idempotency-Key");
     }
-    let digest = canonical_digest(&json!({"op": "reroute", "task": id, "target": target}));
-    let mut rec = match state.core.begin_request(&request_id, "reroute", Some(&id), digest) {
-        Ok(r) => r,
-        Err(e) => return core_error_response(&e),
-    };
-    if rec.status == "completed" {
-        return Json(rec.result).into_response();
-    }
-    // WP09 weekend: the relay body must be previewed and approved before queueing
+    // Validate every input BEFORE creating an idempotency record: a malformed or
+    // stale request must not leave a replayable "completed error" behind.
     let approved_digest = body
         .get("handoff_digest")
         .and_then(|h| h.as_str())
@@ -696,7 +747,22 @@ async fn reroute(
             "the relay body must be previewed and approved: fetch the handoff preview and resend with its digest",
         );
     }
-    match state.core.reroute(&id, &target, &approved_digest, &mut rec) {
+    let revision = match if_match_revision(&headers) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let digest = canonical_digest(&json!({
+        "op": "reroute", "task": id, "target": target,
+        "revision": revision, "handoff": approved_digest
+    }));
+    let mut rec = match state.core.begin_request(&request_id, "reroute", Some(&id), digest) {
+        Ok(r) => r,
+        Err(e) => return core_error_response(&e),
+    };
+    if rec.status == "completed" {
+        return Json(rec.result).into_response();
+    }
+    match state.core.reroute(&id, &target, &approved_digest, revision, &mut rec) {
         Ok(t) => {
             let receipt = routing::build_receipt(&request_id, &t, None, false);
             let result = json!({"receipt": receipt});
@@ -704,7 +770,9 @@ async fn reroute(
             Json(result).into_response()
         }
         Err(e) => {
-            state.core.fail_request(rec, json!({"error": {"code": e.code, "message": e.message}}));
+            // No launch/queue happened. Drop the key so a transient 429 (busy slot)
+            // can be retried with the SAME request id and the persisted intent.
+            state.core.store.delete_request(&request_id);
             core_error_response(&e)
         }
     }

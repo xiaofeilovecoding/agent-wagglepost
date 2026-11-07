@@ -202,11 +202,12 @@ fn g8_budget_exhaustion_blocks_extra_launch() {
     let _ = env.run_until(&task_id, &["interrupted"], Duration::from_secs(90));
     // budget now exhausted (2 launches used) → further relaunch refused with stable reason
     let err = env
-        .req(
+        .req_with_if_match(
             "POST",
             &format!("/v1/tasks/{task_id}/reroute"),
             Some(&json!({"target_adapter": "fake", "handoff_digest": "dummy"})),
             Some("r-2"),
+            env.revision_of(&task_id),
         )
         .unwrap_err();
     assert_eq!(err.1["error"]["code"], json!("budget_exhausted"));

@@ -13,7 +13,7 @@ use crate::worktree::{self, GitConfig};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct CoreConfig {
     pub git: GitConfig,
@@ -108,6 +108,10 @@ pub struct Core {
     pub bus: Arc<EventBus>,
     pub cfg: CoreConfig,
     pub cancel_flags: std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes the slot check + intent consumption + attempt insert. Two
+    /// concurrent dispatches with different idempotency keys must not both pass
+    /// the "no live attempt" check and launch twice for the same task/repo.
+    dispatch_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -190,6 +194,7 @@ impl Core {
             bus,
             cfg,
             cancel_flags: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dispatch_lock: Mutex::new(()),
         })
     }
 
@@ -490,6 +495,15 @@ Sample repository for the offline wagglepost tour.
         if task.status.terminal() {
             return Err(CoreError::conflict("task_terminal", "task already finished"));
         }
+        // A plan is the revision boundary: re-planning bumps the task revision so
+        // every approval/dispatch/decision bound to the old plan becomes stale.
+        if task.status != TaskStatus::AwaitingApproval {
+            return Err(CoreError::conflict(
+                "invalid_state",
+                "a plan can only be created while the task is awaiting approval; use reroute for a stopped task",
+            ));
+        }
+        let next_revision = task.revision + 1;
         let states = self.adapter_states();
         // pick writer: user priority order, first ok for the role
         let pick = |role: Role| -> Result<String, CoreError> {
@@ -583,11 +597,11 @@ Sample repository for the offline wagglepost tour.
         let plan = Plan {
             plan_id: new_id("p"),
             task_id: task.task_id.clone(),
-            task_revision: task.revision,
+            task_revision: next_revision,
             recipe: task.recipe,
             summary_hash: {
                 let canonical = json!({
-                    "task_id": task.task_id, "revision": task.revision,
+                    "task_id": task.task_id, "revision": next_revision,
                     "recipe": task.recipe.as_str(),
                     "steps": steps.iter().map(|s| json!({"step": s.step_id, "role": s.role.as_str(), "adapter": s.adapter, "perm": s.permission})).collect::<Vec<_>>(),
                     "base": task.base_commit,
@@ -601,6 +615,10 @@ Sample repository for the offline wagglepost tour.
             approved_versions: None,
         };
         // attach route evaluation for the receipt (reasons why)
+        let mut revised = task.clone();
+        revised.revision = next_revision;
+        revised.updated_at = now.clone();
+        self.store.update_task(&revised)?;
         self.store.insert_plan(&plan)?;
         self.bus.emit(
             Some(&task.task_id),
@@ -645,15 +663,51 @@ Sample repository for the offline wagglepost tour.
         task_id: &str,
         summary_hash: &str,
         handoff_digest: Option<&str>,
+        expected_revision: Option<u64>,
     ) -> Result<Task, CoreError> {
         let task = self
             .store
             .get_task(task_id)
             .ok_or_else(|| CoreError::not_found("task not found"))?;
+        // Approval is only valid for the current, still-unapproved plan. Without
+        // this guard a retry could move a running task back to queued and emit a
+        // second plan_approved event; same-key replay is handled before this call.
+        if task.status != TaskStatus::AwaitingApproval {
+            return Err(CoreError::conflict(
+                "invalid_state",
+                format!(
+                    "approval is only valid while awaiting approval (task is {})",
+                    task.status.as_str()
+                ),
+            ));
+        }
+        // WP15: approval is a mutation and must name the exact task revision the
+        // user saw. A missing/stale If-Match is refused BEFORE any state change.
+        let expected_revision = expected_revision.ok_or_else(|| {
+            CoreError::conflict(
+                "revision_required",
+                "approval requires If-Match with the task revision you reviewed",
+            )
+        })?;
+        if expected_revision != task.revision {
+            return Err(CoreError::conflict(
+                "revision_mismatch",
+                format!(
+                    "the task is at revision {} but you approved revision {}; refresh the preview",
+                    task.revision, expected_revision
+                ),
+            ));
+        }
         let plan = self
             .store
             .latest_plan(task_id)
             .ok_or_else(|| CoreError::not_found("plan not found"))?;
+        if plan.approved_at.is_some() {
+            return Err(CoreError::conflict(
+                "already_approved",
+                "this plan is already approved; replay with the original request id or fetch the task",
+            ));
+        }
         if plan.summary_hash != summary_hash {
             return Err(CoreError::conflict(
                 "plan_stale",
@@ -681,11 +735,29 @@ Sample repository for the offline wagglepost tour.
             .find(|s| s.role == Role::Writer)
             .ok_or_else(|| CoreError::bad("no_candidate", "plan has no writer step"))?;
         let approved_body = self.assemble_handoff(&task, writer_step, 1, None, None)?;
-        if let Some(d) = handoff_digest {
-            if d != approved_body.sha256 {
+        // A regular task must name the digest of the body the user actually saw.
+        // The built-in all-fake demo is the only exception: its server-pinned
+        // preset is immutable and simulated, so one-click onboarding can bind it
+        // server-side. It never creates a real-capability launch.
+        let demo = self
+            .store
+            .meta_get(&format!("demo_kind:{}", task_id))
+            .is_some()
+            && plan.steps.iter().all(|s| s.adapter == "fake");
+        match handoff_digest {
+            Some(d) if !d.is_empty() => {
+                if d != approved_body.sha256 {
+                    return Err(CoreError::conflict(
+                        "handoff_digest_mismatch",
+                        "the digest you approved does not match the body that would be sent; refresh the preview",
+                    ));
+                }
+            }
+            _ if demo => { /* server-pinned simulated demo: bind below */ }
+            _ => {
                 return Err(CoreError::conflict(
-                    "handoff_digest_mismatch",
-                    "the digest you approved does not match the body that would be sent; refresh the preview",
+                    "handoff_digest_required",
+                    "the first-run body must be previewed and approved: fetch the handoff preview and resend with its digest",
                 ));
             }
         }
@@ -790,6 +862,11 @@ Sample repository for the offline wagglepost tour.
             .latest_plan(task_id)
             .filter(|p| p.approved_at.is_some() && p.task_revision == task.revision)
             .ok_or_else(|| CoreError::conflict("plan_missing", "no approved plan for this revision"))?;
+        // Two concurrent dispatches with different idempotency keys must not both
+        // observe a free slot and launch. The lock covers the intent read, the
+        // slot check and the attempt row insert; it is dropped on every early error.
+        let _dispatch_guard = self.dispatch_lock.lock().unwrap();
+
         // which step runs next?
         let attempts = self.store.list_attempts(task_id);
         let done_steps: Vec<&str> = attempts
@@ -798,14 +875,16 @@ Sample repository for the offline wagglepost tour.
             .map(|a| a.step_id.as_str())
             .collect();
         // explicit relay/resume intent (set by reroute/answer) names the step to re-run;
-        // otherwise pick the first fresh step (never attempted, deps done)
+        // otherwise pick the first fresh step (never attempted, deps done).
+        // WP14: DO NOT clear the intent here. A transient slot/budget/git refusal
+        // must leave it intact so the next dispatch still relays instead of falling
+        // back to "no dispatchable step". It is consumed only after a real attempt
+        // row is persisted.
         let next_step_id = self.store.meta_get(&format!("next_step:{}", task_id));
         let intent_was_set = next_step_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
-        let next_step = match next_step_id {
-            Some(sid) if !sid.is_empty() => {
-                self.store.meta_set(&format!("next_step:{}", task_id), "");
-                plan.steps.iter().find(|s| s.step_id == sid).cloned()
-            }
+        let generation = task.current_generation + 1;
+        let mut next_step = match next_step_id.as_deref() {
+            Some(sid) if !sid.is_empty() => plan.steps.iter().find(|s| s.step_id == sid).cloned(),
             _ => plan
                 .steps
                 .iter()
@@ -817,7 +896,6 @@ Sample repository for the offline wagglepost tour.
         }
         .filter(|s| {
             // even an intent-named step cannot run twice in the same generation
-            let generation = task.current_generation + 1;
             !attempts.iter().any(|a| {
                 a.step_id == s.step_id && (a.status.live() || a.generation >= generation)
             })
@@ -829,6 +907,49 @@ Sample repository for the offline wagglepost tour.
                     CoreError::conflict("no_dispatchable_step", "no runnable step (writer done? review done?)")
                 }
             })?;
+
+        // WP14: the persisted relay intent names the runtime the user approved for
+        // THIS generation. Re-check it against allowed_adapters, the write gate and
+        // the version bound at approval; only then does it become the effective step.
+        let relay_target = if next_step.role == Role::Writer {
+            self.store
+                .meta_get(&format!("reroute_target:{task_id}:{generation}"))
+        } else {
+            None
+        };
+        if let Some(target) = relay_target.as_deref() {
+            if !task.allowed_adapters.iter().any(|a| a == target) {
+                return Err(CoreError::conflict(
+                    "target_not_allowed",
+                    format!("{target} is not in the task's allowed runtimes; refusing to launch"),
+                ));
+            }
+            let states = self.adapter_states();
+            let target_state = states.iter().find(|s| s.id == target).ok_or_else(|| {
+                CoreError::bad("unknown_adapter", format!("unknown adapter {target}"))
+            })?;
+            if !target_state.available || !target_state.write_ok {
+                return Err(CoreError::conflict(
+                    "write_gate_failed",
+                    format!("{target} has not passed the independent write-capability gate"),
+                ));
+            }
+            let bound_version = self
+                .store
+                .meta_get(&format!("reroute_version:{task_id}:{generation}"))
+                .unwrap_or_default();
+            let current_version = target_state.version.clone().unwrap_or_default();
+            if bound_version.is_empty() || bound_version != current_version {
+                return Err(CoreError::conflict(
+                    "adapter_version_drift",
+                    format!(
+                        "{target} changed since the reroute approval (approved {}, now {}); preview and confirm again",
+                        bound_version, current_version
+                    ),
+                ));
+            }
+            next_step.adapter = target.to_string();
+        }
 
         // hard routing gate at dispatch time
         let live = self.store.list_live_attempts();
@@ -866,6 +987,25 @@ Sample repository for the offline wagglepost tour.
         // assemble handoff (local, deterministic)
         let generation = task.current_generation + 1;
         let relay_cp = self.store.latest_checkpoint(task_id);
+        // WP14: a reroute approved a specific checkpoint. If a newer/different
+        // checkpoint appeared before launch (late event, restart) the approved
+        // intent no longer describes the work that would be inherited.
+        if next_step.role == Role::Writer && generation > 1 {
+            if let Some(bound_cp) =
+                self.store.meta_get(&format!("reroute_checkpoint:{task_id}:{generation}"))
+            {
+                let actual_cp = relay_cp
+                    .as_ref()
+                    .map(|c| c.checkpoint_id.as_str())
+                    .unwrap_or("");
+                if !bound_cp.is_empty() && bound_cp != actual_cp {
+                    return Err(CoreError::conflict(
+                        "checkpoint_drift",
+                        "the checkpoint changed since the reroute approval; preview and confirm again",
+                    ));
+                }
+            }
+        }
         let handoff = self.assemble_handoff(&task, &next_step, generation, None, relay_cp)?;
         let _body_digest = sha256_hex(handoff.text.as_bytes());
         if handoff.bytes > handoff.budget_bytes {
@@ -987,6 +1127,11 @@ Sample repository for the offline wagglepost tour.
         t.launches_used += 1;
         t.updated_at = timestamp();
         self.store.update_task(&t)?;
+        // The attempt row and its ownership are durable, so the queued intent has
+        // now been consumed. Every earlier refusal path returned before this point.
+        if intent_was_set {
+            self.store.meta_set(&format!("next_step:{}", task_id), "");
+        }
         self.store.resolve_message_by_task(task_id, "blocked");
         self.bus.emit(
             Some(task_id),
@@ -1008,6 +1153,20 @@ Sample repository for the offline wagglepost tour.
         let core = self.clone();
         let attempt_id = attempt.attempt_id.clone();
         let task_id2 = task_id.to_string();
+        let relay_intent = relay_target.as_ref().map(|target| adapters::RelayIntent {
+            target: target.clone(),
+            checkpoint_id: self
+                .store
+                .meta_get(&format!("reroute_checkpoint:{task_id}:{generation}"))
+                .or_else(|| {
+                    self.store
+                        .latest_checkpoint(task_id)
+                        .map(|c| c.checkpoint_id)
+                })
+                .unwrap_or_default(),
+            adapter_version: self.version_of(target),
+            handoff_digest: handoff.sha256.clone(),
+        });
         let ctx = DispatchContext {
             task: t.clone(),
             attempt_id: attempt_id.clone(),
@@ -1026,6 +1185,7 @@ Sample repository for the offline wagglepost tour.
             } else {
                 None
             },
+            relay: relay_intent,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flags
@@ -1342,6 +1502,8 @@ failure_location: cp
         let generation = ctx.generation;
         let attempt_id2 = attempt_id.to_string();
         let bus = self.bus.clone();
+        let relay = ctx.relay.clone();
+        let relay_announced = Arc::new(AtomicBool::new(false));
         let seen_keys: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let on_event = move |ev: &WireEvent| {
@@ -1363,6 +1525,30 @@ failure_location: cp
                 &ev.kind,
                 ev.payload.clone(),
             );
+            // WP14: a real runtime has now started (agent_started). This is the
+            // only place a reroute is announced, with the actual attempt id and
+            // the actually launched target — never the request id, never at queue.
+            if ev.kind == "agent_started" {
+                if let Some(r) = &relay {
+                    if !relay_announced.swap(true, Ordering::SeqCst) {
+                        bus.emit(
+                            Some(task_id),
+                            Some(&attempt_id2),
+                            generation,
+                            "reroute_started",
+                            json!({
+                                "attempt_id": attempt_id2,
+                                "target": r.target,
+                                "checkpoint": r.checkpoint_id,
+                                "adapter_version": r.adapter_version,
+                                "handoff_digest": r.handoff_digest,
+                                "generation": generation,
+                                "simulated": r.target == "fake",
+                            }),
+                        );
+                    }
+                }
+            }
         };
 
         let outcome = adapters::run_attempt(adapter_box.as_mut(), &ctx, cancel, &on_event);
@@ -1387,7 +1573,7 @@ failure_location: cp
                 Some(attempt_id),
                 a.generation,
                 "attempt_failed",
-                json!({"error": err}),
+                json!({"error": crate::redact::redact(err)}),
             );
             if let Some(mut t) = self.store.get_task(&a.task_id) {
                 t.status = TaskStatus::Interrupted;
@@ -1439,23 +1625,38 @@ failure_location: cp
             );
             return;
         }
-        attempt.status = AttemptStatus::Completed;
+        // A process that exited non-zero without any structured result is a failed
+        // attempt (e.g. a runtime that rejected the launch), not a completed one.
+        let no_structured_result = res.state.last_text.is_none() && res.state.fake_result.is_none();
+        let nonzero_exit = res.exit.exit_code.map(|c| c != 0).unwrap_or(false);
+        attempt.status = if nonzero_exit && no_structured_result {
+            AttemptStatus::Failed
+        } else {
+            AttemptStatus::Completed
+        };
         let _ = self.store.update_attempt(&attempt);
 
-        // persist stderr as attempt log (bounded already)
+        // persist stderr as attempt log (bounded already) — WP16: scrub credential
+        // values BEFORE the bytes reach disk, keeping the error class/location.
         let log_path = self
             .cfg
             .managed_root
             .join("logs")
             .join(format!("{attempt_id}.stderr.log"));
         let _ = std::fs::create_dir_all(log_path.parent().unwrap());
-        let _ = std::fs::write(&log_path, &res.exit.stderr);
+        let stderr_text = crate::redact::redact(&String::from_utf8_lossy(&res.exit.stderr));
+        let _ = std::fs::write(&log_path, stderr_text.as_bytes());
 
-        let result = adapters::extract_agent_result(res.state.last_text.as_deref().unwrap_or(""))
+        let mut result = adapters::extract_agent_result(res.state.last_text.as_deref().unwrap_or(""))
             .or(Some(match &res.state.fake_result {
                 Some(r) => r.clone(),
                 None => adapter_result_fallback(&res.state, &res.exit),
             }));
+        if let Some(r) = result.as_mut() {
+            // WP16: the structured result is the source for decisions, checkpoints,
+            // inbox messages and relay bodies; scrub it once, here.
+            crate::redact::redact_agent_result(r);
+        }
 
         let Some(mut task) = self.store.get_task(task_id) else {
             return;
@@ -1847,7 +2048,7 @@ failure_location: cp
             changed_files: obs.changed_files,
             untracked_files: obs.untracked_files,
             patch_path: Some(patch_path.to_string_lossy().to_string()),
-            failure_summary: failure_summary.map(|s| s.to_string()),
+            failure_summary: failure_summary.map(|s| crate::redact::redact(s)),
             source,
             created_at: timestamp(),
         };
@@ -2005,12 +2206,30 @@ failure_location: cp
         task_id: &str,
         target_adapter: &str,
         approved_digest: &str,
-        request: &mut RequestRecord,
+        expected_revision: Option<u64>,
+        _request: &mut RequestRecord,
     ) -> Result<Task, CoreError> {
         let task = self
             .store
             .get_task(task_id)
             .ok_or_else(|| CoreError::not_found("task not found"))?;
+        // WP14: bind the request to the revision whose checkpoint/body the user
+        // previewed; a stale If-Match must never queue a new launch.
+        let expected_revision = expected_revision.ok_or_else(|| {
+            CoreError::conflict(
+                "revision_required",
+                "reroute requires If-Match with the task revision you reviewed",
+            )
+        })?;
+        if expected_revision != task.revision {
+            return Err(CoreError::conflict(
+                "revision_mismatch",
+                format!(
+                    "the task is at revision {} but you approved revision {}; refresh the preview",
+                    task.revision, expected_revision
+                ),
+            ));
+        }
         // reroute eligible from stopped states with confirmed old writer exit + checkpoint,
         // or from needs_review when the current candidate's review found issues (manual reroute)
         let review_failed = task.status == TaskStatus::NeedsReview
@@ -2055,6 +2274,15 @@ failure_location: cp
         if old_writer_live {
             return Err(CoreError::conflict("writer_still_running", "old writer has not confirmed exit"));
         }
+        // WP14: the requested target must be user-allowed AND capable. The earlier
+        // bug accepted any runtime-available adapter and then dispatched the old
+        // plan step, silently launching the wrong tool.
+        if !task.allowed_adapters.iter().any(|a| a == target_adapter) {
+            return Err(CoreError::conflict(
+                "target_not_allowed",
+                format!("{target_adapter} is not in the task's allowed runtimes"),
+            ));
+        }
         // target gate: only adapters that independently passed the write gate
         let states = self.adapter_states();
         let target = states
@@ -2065,6 +2293,13 @@ failure_location: cp
             return Err(CoreError::conflict(
                 "write_gate_failed",
                 format!("{target_adapter} has not passed the independent write-capability gate; export the patch and hand off manually"),
+            ));
+        }
+        let target_version = target.version.clone().unwrap_or_default();
+        if target_version.is_empty() {
+            return Err(CoreError::conflict(
+                "version_unavailable",
+                format!("{target_adapter} has no observable version; cannot bind the reroute"),
             ));
         }
         // WP10: disclose the FULL relay cost before any launch — the relay writer
@@ -2125,19 +2360,28 @@ failure_location: cp
             &format!("approved_relay_digest:{}:{}", task_id, relay_generation),
             &relay_body.sha256,
         );
+        // WP14: persist the complete intent. A crash or a transient busy refusal
+        // must not lose which runtime/version/checkpoint/body the user approved.
+        self.store.meta_set(
+            &format!("reroute_target:{}:{}", task_id, relay_generation),
+            target_adapter,
+        );
+        self.store.meta_set(
+            &format!("reroute_version:{}:{}", task_id, relay_generation),
+            &target_version,
+        );
+        self.store.meta_set(
+            &format!("reroute_checkpoint:{}:{}", task_id, relay_generation),
+            &cp.checkpoint_id,
+        );
         let mut t = task;
         t.status = TaskStatus::Queued;
         t.resume_used += 1;
         t.updated_at = timestamp();
         self.store.update_task(&t)?;
         self.store.resolve_message_by_task(task_id, "blocked");
-        self.bus.emit(
-            Some(task_id),
-            Some(&request.request_id),
-            t.current_generation + 1,
-            "reroute_started",
-            json!({"target": target_adapter, "checkpoint": cp.checkpoint_id, "generation": t.current_generation + 1}),
-        );
+        // No reroute_started here: queueing is not launch evidence. The attempt
+        // worker publishes it with the real attempt id after agent_started.
         Ok(t)
     }
 
@@ -2307,7 +2551,8 @@ failure_location: cp
             message_id: new_id("m"),
             task_id: task_id.to_string(),
             kind: kind.to_string(),
-            payload,
+            // WP16: the inbox is an external/shareable surface; scrub before persist.
+            payload: crate::redact::redact_value(&payload),
             dedupe_key,
             merge_count: 1,
             resolved: false,
@@ -2369,7 +2614,7 @@ failure_location: cp
         let reviews = self.store.list_reviews(task_id);
         let candidates = self.store.list_candidates(task_id);
         let worktrees = self.store.list_task_worktrees(task_id);
-        let checkpoints: Vec<Value> = Vec::new();
+        let checkpoints = self.store.list_checkpoints(task_id);
         let has_open_decision = decisions.iter().any(|d| d.status == "open");
         let receipt = routing::build_receipt(
             &self

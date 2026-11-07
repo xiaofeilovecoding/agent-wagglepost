@@ -528,7 +528,11 @@ function SampleButton({ lang, onDone, onError, kind }: { lang: Lang; onDone: (id
     const id = r.task.task_id;
     await api.trust(id);
     const p = await api.plan(id);
-    await api.approve(id, p.plan.summary_hash);
+    // One click for the built-in simulated tour: the UI still fetches and sends
+    // the exact previewed body digest + current revision + saved request id.
+    const preview = await api.handoffPreview(id, "writer");
+    const fresh = await api.task(id);
+    await api.approve(id, p.plan.summary_hash, fresh.task.revision, preview.approved_digest, randomIdem("sample-approve"));
     return id;
   };
   return (
@@ -648,6 +652,7 @@ function TaskView({
   onReceipt,
 }: any) {
   const [resumePreview, setResumePreview] = useState<{ digest: string; text: string; bytes: number; decisionId: string; optionId: string } | null>(null);
+  const [approvalPreview, setApprovalPreview] = useState<{ digest: string; text: string; bytes: number; revision: number } | null>(null);
   const [handoff, setHandoff] = useState<any>(null);
   const [diff, setDiff] = useState<any>(null);
   const [showDiff, setShowDiff] = useState(false);
@@ -694,15 +699,32 @@ function TaskView({
           ? t("dispatchPath", lang)
           : t("taskTrajectory", lang);
 
-  // main action per contract: one bounded action from the receipt
+  // main action per contract: one bounded action from the receipt. Dispatch is
+  // valid only while queued; a stale receipt from the previous dispatch must not
+  // keep offering Dispatch after the writer/reviewer already ran.
   const next = snap.receipt?.next_action?.action;
+  const dispatchReady = status === "queued";
   const primary = async () => {
     setBusy(true);
     try {
       if (status === "awaiting_approval" && snap.plan) {
-        await api.approve(task.task_id, snap.plan.summary_hash);
+        // WP15 two-step: first click fetches and shows the exact first-run body;
+        // only the confirm click sends its digest + the current revision.
+        if (!approvalPreview || approvalPreview.revision !== task.revision) {
+          const prev = await api.handoffPreview(task.task_id, "writer");
+          setApprovalPreview({
+            digest: prev.approved_digest,
+            text: prev.handoff.text,
+            bytes: prev.handoff.bytes,
+            revision: task.revision,
+          });
+          setBusy(false);
+          return;
+        }
+        await api.approve(task.task_id, snap.plan.summary_hash, task.revision, approvalPreview.digest, randomIdem("web-approve"));
+        setApprovalPreview(null);
         showToast(lang === "zh" ? "计划已确认，进入队列" : "Plan approved, queued");
-      } else if (next === "dispatch" || status === "queued" || status === "needs_review" && attempts.length === 0) {
+      } else if (dispatchReady) {
         const r = await api.dispatch(task.task_id, randomIdem("web-disp"));
         showToast(`${t("dispatched", lang)} · ${r.receipt?.attempt_id ?? ""}`);
       } else if (status === "waiting_decision" && decision && decisionChoice) {
@@ -749,8 +771,12 @@ function TaskView({
   };
 
   const primaryLabel = (() => {
-    if (status === "awaiting_approval") return t("approvePlan", langBtns);
-    if (next === "dispatch") return t("confirmDispatch", langBtns);
+    if (status === "awaiting_approval") {
+      return approvalPreview && approvalPreview.revision === task.revision
+        ? (lang === "zh" ? "确认发送此正文" : "Confirm this body")
+        : t("approvePlan", langBtns);
+    }
+    if (dispatchReady) return t("confirmDispatch", langBtns);
     if (status === "waiting_decision") {
       return resumePreview && decision && resumePreview.decisionId === decision.decision_id && resumePreview.optionId === decisionChoice
         ? (lang === "zh" ? "确认发送此正文" : "Confirm this body")
@@ -908,6 +934,17 @@ function TaskView({
           {phase === 1 && (
             <ReroutePanel lang={lang} task={task} snap={snap} busy={busy} setBusy={setBusy} showToast={showToast} refreshTask={refreshTask} refreshTasks={refreshTasks} />
           )}
+          {approvalPreview && status === "awaiting_approval" && (
+            <details open>
+              <summary>
+                {lang === "zh" ? "待批准正文预览" : "Body awaiting approval"} — {approvalPreview.bytes} {t("bytes", lang)}
+              </summary>
+              <div className="diffbox">{approvalPreview.text}</div>
+              <p className="muted" style={{ fontSize: 12 }}>
+                revision: <code>{approvalPreview.revision}</code> · digest: <code>{approvalPreview.digest}</code>
+              </p>
+            </details>
+          )}
           {handoff && ["awaiting_approval"].includes(status) && (
             <details>
               <summary>
@@ -1052,7 +1089,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
                   }
                   setBusy(true);
                   try {
-                    await api.reroute(task.task_id, c.adapter, pending.digest, randomIdem("web-rr"));
+                    await api.reroute(task.task_id, c.adapter, pending.digest, task.revision, randomIdem("web-rr"));
                     showToast(lang === "zh" ? "换轨已排队" : "Reroute queued");
                     setPending(null);
                     await refreshTask(task.task_id);

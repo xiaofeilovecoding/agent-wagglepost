@@ -8,6 +8,7 @@ pub mod instance_lock;
 pub mod http;
 pub mod ids;
 pub mod model;
+pub mod redact;
 pub mod routing;
 pub mod runner;
 pub mod store;

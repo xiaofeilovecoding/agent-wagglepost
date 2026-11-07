@@ -108,7 +108,7 @@ fn wp02_post_checkout_hook_not_executed() {
     env.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).expect("trust");
     env.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None).expect("plan");
     let hash = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"]["summary_hash"].as_str().unwrap().to_string();
-    env.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
+    env.approve_current(&task_id, &hash).expect("approve");
     env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp02-d1")).expect("dispatch");
     let status = env.run_until(&task_id, &["needs_review", "interrupted"], Duration::from_secs(90));
     assert_eq!(status, "needs_review");
@@ -520,7 +520,7 @@ fn wp02b_included_filter_repo_refused_fail_closed() {
     env.req("POST", &format!("/v1/tasks/{t2}/trust"), Some(&json!({})), None).expect("trust");
     let plan2 = env.req("POST", &format!("/v1/tasks/{t2}/plan"), Some(&json!({})), None).expect("plan");
     let hash2 = plan2["plan"]["summary_hash"].as_str().unwrap().to_string();
-    env.req("POST", &format!("/v1/tasks/{t2}/plan/approve"), Some(&json!({"summary_hash": hash2})), None).expect("approve");
+    env.approve_current(&t2, &hash2).expect("approve");
     let _ = body2;
     let _ = (&t2, &head_hash);
     // the late filter appears AFTER approval → dispatch refuses (fail closed)
@@ -615,20 +615,22 @@ fn wp09_tampered_digest_rejected_and_dispatch_verifies_binding() {
     let prev = env.req("GET", &format!("/v1/tasks/{task_id}/handoff-preview"), None, None).unwrap();
     let real_digest = prev["approved_digest"].as_str().unwrap().to_string();
     // tampered digest → approve refused
-    let tampered = format!("{}0", &real_digest[..63]);
-    let err = env.req(
+    let tampered = TestEnv::tamper_digest(&real_digest);
+    let err = env.req_with_if_match(
         "POST",
         &format!("/v1/tasks/{task_id}/plan/approve"),
         Some(&json!({"summary_hash": env.plan_hash(&task_id), "handoff_digest": tampered})),
         Some("wp09-tamper"),
+        env.revision_of(&task_id),
     ).unwrap_err();
     assert_eq!(err.1["error"]["code"], json!("handoff_digest_mismatch"), "tampered digest must not approve");
     // correct digest → approved and STORED
-    env.req(
+    env.req_with_if_match(
         "POST",
         &format!("/v1/tasks/{task_id}/plan/approve"),
         Some(&json!({"summary_hash": env.plan_hash(&task_id), "handoff_digest": real_digest})),
         Some("wp09-ok"),
+        env.revision_of(&task_id),
     ).expect("approve with the previewed digest");
     let plan = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"].clone();
     assert_eq!(plan["approved_handoff_digest"], json!(real_digest), "approval stores the body digest");
@@ -691,11 +693,12 @@ fn wp10_reroute_budget_disclosure_and_no_extra_launch() {
     assert_eq!(dbg["reviews"][0]["verdict"], json!("issues"), "issues verdict needed for eligibility");
     println!("[w10] status={} launches={}", dbg["task"]["status"], dbg["task"]["launches_used"]);
     let digest = env.relay_digest(&task_id, None, None);
-    let err = env.req(
+    let err = env.req_with_if_match(
         "POST",
         &format!("/v1/tasks/{task_id}/reroute"),
         Some(&json!({"target_adapter": "fake", "handoff_digest": digest})),
         Some("wp10-rr"),
+        env.revision_of(&task_id),
     ).unwrap_err();
     println!("[w10] reroute error: {}", err.1["error"]);
     assert_eq!(err.1["error"]["code"], json!("budget_exhausted"));

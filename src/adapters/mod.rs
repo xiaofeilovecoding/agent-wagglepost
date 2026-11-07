@@ -26,6 +26,17 @@ pub struct DispatchContext {
     /// candidate the REVIEWER is bound to at launch (WP04: identity from the start
     /// of the run, not re-read from the current candidate at finish)
     pub bound_candidate_hash: Option<String>,
+    /// WP14: set only for an approved relay launch. The first real runtime event
+    /// (agent_started) publishes reroute_started with the actual attempt id.
+    pub relay: Option<RelayIntent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RelayIntent {
+    pub target: String,
+    pub checkpoint_id: String,
+    pub adapter_version: String,
+    pub handoff_digest: String,
 }
 
 #[derive(Clone)]

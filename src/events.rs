@@ -46,7 +46,9 @@ impl EventBus {
             attempt_id: attempt_id.map(|s| s.to_string()),
             generation,
             kind: kind.to_string(),
-            payload,
+            // WP16: every event payload is scrubbed here, before SQLite/SSE/UI.
+            // This is the single wire boundary shared by adapters, core and logs.
+            payload: crate::redact::redact_value(&payload),
             ts: crate::store::timestamp(),
         };
         let _ = self.store.append_event(&e);

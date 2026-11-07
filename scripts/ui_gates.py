@@ -301,6 +301,59 @@ def main():
 
         gate("g6_console_and_network", g11_console_and_network)
 
+        def g12_narrow_list_long_titles():
+            # WP17: long titles (zh + en) on narrow viewports must stay INSIDE
+            # their list row — no horizontal overflow, no overlap with the
+            # status badge — on both the desk list and history.
+            titles = [
+                ("一个故意非常长的任务标题用于窄屏工作台与历史列表的状态徽标覆盖与横向溢出验证场景名称", "g12-zh"),
+                ("An intentionally long task title for the narrow desk and history list status badge overlap and horizontal overflow probe", "g12-en"),
+            ]
+            for title, key in titles:
+                st = page.evaluate(
+                    """async ([t, k]) => {
+                      const c = await (await fetch('/v1/session/csrf', {credentials:'same-origin'})).json();
+                      const r = await fetch('/v1/tasks', {method:'POST', credentials:'same-origin',
+                        headers:{'Content-Type':'application/json','X-CSRF-Token':c.csrf,'Idempotency-Key':k},
+                        body: JSON.stringify({title:t, goal:'fixture', repo_path:'sample:demo', allowed_adapters:['fake'], recipe:'direct'})});
+                      return r.status;
+                    }""", [title, key])
+                assert st == 200, f"long-title task submit failed: {st}"
+
+            def measure(width):
+                page.set_viewport_size({"width": width, "height": 800})
+                page.wait_for_timeout(250)
+                for nav_idx, label in ((0, "desk"), (2, "history")):
+                    page.locator(".nav button").nth(nav_idx).click()
+                    page.wait_for_selector(".taskrow")
+                    for lang in ("zh", "en"):
+                        if lang == "en":
+                            page.click("#language")
+                            page.wait_for_timeout(200)
+                        rows = page.locator(".taskrow").evaluate_all(
+                            """rows => rows.map(row => {
+                              const title=row.querySelector('.t-title'),tag=row.querySelector('.tag');
+                              if (!title || !tag) return {};
+                              const r=document.createRange();r.selectNodeContents(title);
+                              const txt=r.getBoundingClientRect(),b=tag.getBoundingClientRect();
+                              return {docw:document.documentElement.scrollWidth,innw:window.innerWidth,
+                                      overlap:txt.right>b.left && txt.bottom>b.top && txt.top<b.bottom}; })""")
+                        for i, r in enumerate(rows):
+                            if not r:
+                                continue
+                            assert r["docw"] <= r["innw"] + 1, (
+                                f"{label}/{lang}/{width} row{i}: horizontal overflow doc={r['docw']} viewport={r['innw']}")
+                            assert not r["overlap"], (
+                                f"{label}/{lang}/{width} row{i}: title overlaps the status badge")
+                        if lang == "en":
+                            page.click("#language")  # back to zh
+
+            measure(390)
+            measure(320)
+            page.set_viewport_size({"width": 1440, "height": 900})
+
+        gate("g6_narrow_list_long_titles", g12_narrow_list_long_titles)
+
         # screenshots for the report (1440 light/dark + 390)
         page.wait_for_timeout(300)
         page.set_viewport_size({"width": 1440, "height": 900})

@@ -615,6 +615,24 @@ impl Store {
         .ok()
     }
 
+    /// All saved checkpoints for the task, newest first. The task snapshot used
+    /// to return an empty array here, hiding the kept partial work from the UI
+    /// and from reconciliation clients even though the row existed.
+    pub fn list_checkpoints(&self, task_id: &str) -> Vec<Checkpoint> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = match c.prepare(&format!(
+            "SELECT {CHECKPOINT_COLS} FROM checkpoints WHERE task_id=?1 ORDER BY created_at DESC"
+        )) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![task_id], row_checkpoint as RowMapper<Checkpoint>);
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn get_checkpoint(&self, checkpoint_id: &str) -> Option<Checkpoint> {
         let c = self.conn.lock().unwrap();
         c.query_row(

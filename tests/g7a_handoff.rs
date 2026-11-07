@@ -177,13 +177,7 @@ fn g7a_overlong_material_trimmed_with_notice() {
         .as_str()
         .unwrap()
         .to_string();
-    env.req(
-        "POST",
-        &format!("/v1/tasks/{task_id}/plan/approve"),
-        Some(&json!({"summary_hash": hash})),
-        None,
-    )
-    .unwrap();
+    env.approve_current(&task_id, &hash).unwrap();
     let resp = env
         .req(
             "POST",

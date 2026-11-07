@@ -53,6 +53,8 @@ fn print_usage() {
                                                                  confirm with the reviewed digest\n\
            wagglepost why <task_id> --json                       route reasons + events\n\
            wagglepost dispatch <task_id> --json                  dispatch next step\n\
+           wagglepost approve <task_id> <plan_hash> [--json]     preview the first-run body\n\
+           wagglepost approve <task_id> <plan_hash> --digest <d> confirm revision + digest\n\
            wagglepost accept <task_id> <candidate_hash> --json   accept a candidate\n\
            wagglepost cancel <attempt_id> --json                 cancel an attempt\n\
          \n\
@@ -230,6 +232,21 @@ fn http_req(
     body: Option<&Value>,
     idem: Option<&str>,
 ) -> Result<Value, String> {
+    http_req_rev(port, token, csrf, method, path, body, idem, None)
+}
+
+/// Same request with an explicit optimistic-concurrency binding. Used by the
+/// first-approval command so the revision the user saw travels with the digest.
+fn http_req_rev(
+    port: u16,
+    token: &str,
+    csrf: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    idem: Option<&str>,
+    if_match: Option<u64>,
+) -> Result<Value, String> {
     let mut req = ureq_request(method, &format!("http://127.0.0.1:{port}{path}"));
     req = req.set("Authorization", &format!("Bearer {token}"));
     if !csrf.is_empty() && method != "GET" {
@@ -238,6 +255,9 @@ fn http_req(
     }
     if let Some(k) = idem {
         req = req.set("Idempotency-Key", k);
+    }
+    if let Some(rev) = if_match {
+        req = req.set("If-Match", &format!("\"{rev}\""));
     }
     let resp = match body {
         Some(b) => req.send_json(b.clone()),
@@ -432,15 +452,57 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
         "approve" => {
             let id = args.first().cloned().unwrap_or_default();
             let hash = args.get(1).cloned().unwrap_or_default();
-            http_req(
+            // WP15: bind the current task revision + the previewed body digest.
+            let snap = match http_req(port, &token, &csrf, "GET", &format!("/v1/tasks/{id}"), None, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let rev = snap["task"]["revision"].as_u64().unwrap_or(0);
+            let preview = match http_req(
                 port,
                 &token,
                 &csrf,
-                "POST",
-                &format!("/v1/tasks/{id}/plan/approve"),
-                Some(&json!({"summary_hash": hash})),
+                "GET",
+                &format!("/v1/tasks/{id}/handoff-preview?role=writer"),
                 None,
-            )
+                None,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let digest = preview["approved_digest"].as_str().unwrap_or("").to_string();
+            if let Some(user_digest) = flag_value(&args, "--digest") {
+                let rid = format!("cli-{}", wagglepost::ids::new_token()[..12].to_string());
+                http_req_rev(
+                    port,
+                    &token,
+                    &csrf,
+                    "POST",
+                    &format!("/v1/tasks/{id}/plan/approve"),
+                    Some(&json!({"summary_hash": hash, "handoff_digest": user_digest})),
+                    Some(&rid),
+                    Some(rev),
+                )
+            } else {
+                // nothing is submitted: show the body, revision and digest first
+                Ok(json!({
+                    "previewed": true,
+                    "task_id": id,
+                    "revision": rev,
+                    "digest": digest,
+                    "handoff": {
+                        "text": preview["handoff"]["text"],
+                        "bytes": preview["handoff"]["bytes"],
+                    },
+                    "next": format!("re-run approve {id} {hash} --digest {digest}"),
+                }))
+            }
         }
         _ => Err("unknown client command".into()),
     };

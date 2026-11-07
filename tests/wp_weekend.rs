@@ -116,7 +116,7 @@ fn wp09c_wrong_resume_digest_refused_without_cost() {
     ).unwrap();
     let real_digest = prev["approved_digest"].as_str().unwrap().to_string();
     // wrong digest → refused, no queue, no launch, budget untouched
-    let tampered = format!("{}0", &real_digest[..63]);
+    let tampered = TestEnv::tamper_digest(&real_digest);
     let err = env.req(
         "POST",
         &format!("/v1/decisions/{}/answer", card["decision_id"].as_str().unwrap()),
@@ -168,19 +168,22 @@ fn wp09d_reroute_requires_and_verifies_digest() {
     // wrong digest → refused
     let prev = env.req("GET", &format!("/v1/tasks/{task_id}/handoff-preview"), None, None).unwrap();
     let real_digest = prev["approved_digest"].as_str().unwrap().to_string();
-    let err2 = env.req(
+    let rev = env.revision_of(&task_id);
+    let err2 = env.req_with_if_match(
         "POST",
         &format!("/v1/tasks/{task_id}/reroute"),
-        Some(&json!({"target_adapter": "fake", "handoff_digest": format!("{}0", &real_digest[..63])})),
+        Some(&json!({"target_adapter": "fake", "handoff_digest": TestEnv::tamper_digest(&real_digest)})),
         Some("rr-wd"),
+        rev,
     ).unwrap_err();
     assert_eq!(err2.1["error"]["code"], json!("handoff_digest_mismatch"));
     // correct digest → queued; the relay attempt binds the approved digest
-    env.req(
+    env.req_with_if_match(
         "POST",
         &format!("/v1/tasks/{task_id}/reroute"),
         Some(&json!({"target_adapter": "fake", "handoff_digest": real_digest})),
         Some("rr-ok"),
+        rev,
     ).expect("reroute with the previewed digest");
     let _ = env.run_until(&task_id, &["needs_review", "interrupted"], Duration::from_secs(90));
     let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
@@ -259,7 +262,7 @@ fn wp13_sample_script_endpoint_removed_and_demo_presets_server_side() {
     let tid = resp["task"]["task_id"].as_str().unwrap().to_string();
     env.req("POST", &format!("/v1/tasks/{tid}/trust"), Some(&json!({})), None).expect("trust");
     let plan = env.req("POST", &format!("/v1/tasks/{tid}/plan"), Some(&json!({})), None).expect("plan");
-    env.req("POST", &format!("/v1/tasks/{tid}/plan/approve"), Some(&json!({"summary_hash": plan["plan"]["summary_hash"]})), None).expect("approve");
+    env.approve_current(&tid, plan["plan"]["summary_hash"].as_str().unwrap()).expect("approve");
     env.req("POST", &format!("/v1/tasks/{tid}/dispatch"), Some(&json!({})), Some("wp13-d1")).expect("dispatch");
     let status = env.run_until(&tid, &["waiting_decision"], Duration::from_secs(60));
     assert_eq!(status, "waiting_decision", "the built-in decision preset ran");

@@ -204,12 +204,7 @@ fn g2_untrusted_repo_cannot_dispatch() {
         .to_string();
     // approve without trust → rejected
     let err = env
-        .req(
-            "POST",
-            &format!("/v1/tasks/{task_id}/plan/approve"),
-            Some(&json!({"summary_hash": hash})),
-            None,
-        )
+        .approve_current(&task_id, &hash)
         .unwrap_err();
     assert_eq!(err.0, 409);
     assert_eq!(err.1["error"]["code"], json!("repo_untrusted"));

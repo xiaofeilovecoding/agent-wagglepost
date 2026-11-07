@@ -42,6 +42,12 @@ fn unique_root() -> PathBuf {
 
 impl TestEnv {
     pub fn new() -> Arc<TestEnv> {
+        Self::new_with_cfg(|_| {})
+    }
+
+    /// Variant with direct CoreConfig overrides (e.g. the offline codex version
+    /// stub used by the WP14 two-fixture reroute test).
+    pub fn new_with_cfg(f: impl FnOnce(&mut CoreConfig)) -> Arc<TestEnv> {
         let root = unique_root();
         let managed = root.join("managed");
         let user_repo = root.join("user-repo");
@@ -61,6 +67,7 @@ impl TestEnv {
         cfg.managed_root = managed.clone();
         cfg.git.managed_root = managed.clone();
         cfg.fake_exe = Some(PathBuf::from(env!("CARGO_BIN_EXE_wagglepost")));
+        f(&mut cfg);
         let core = Core::new(store, cfg);
         let core2 = core.clone();
 
@@ -225,13 +232,7 @@ impl TestEnv {
                 .meta_set(&format!("fake_script:{}:s1", task_id), &s.to_string());
         }
         let hash = plan["plan"]["summary_hash"].as_str().unwrap().to_string();
-        self.req(
-            "POST",
-            &format!("/v1/tasks/{task_id}/plan/approve"),
-            Some(&json!({"summary_hash": hash})),
-            None,
-        )
-        .expect("approve");
+        self.approve_current(&task_id, &hash).expect("approve");
         (task_id, hash)
     }
 
@@ -251,6 +252,16 @@ impl TestEnv {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Flip the last hex digit so a "wrong digest" is guaranteed different even
+    /// when the real digest happens to end in the digit the probe would append.
+    pub fn tamper_digest(real: &str) -> String {
+        let mut s = real.to_string();
+        let last = if s.ends_with('0') { '1' } else { '0' };
+        s.pop();
+        s.push(last);
+        s
     }
 
     /// WP09: answer a decision card with the previewed body digest (save + queue).
@@ -280,15 +291,75 @@ impl TestEnv {
     /// WP09: reroute with the previewed relay body digest.
     pub fn reroute_queued(&self, task_id: &str, target: &str, idem: &str) -> Value {
         let digest = self.relay_digest(task_id, None, None);
-        self.req(
+        let rev = self.revision_of(task_id);
+        self.req_with_if_match(
             "POST",
             &format!("/v1/tasks/{task_id}/reroute"),
             Some(&json!({"target_adapter": target, "handoff_digest": digest})),
             Some(idem),
+            rev,
         )
-        .expect("reroute with previewed digest")
+        .expect("reroute with previewed digest and current revision")
     }
 
+
+    /// WP14/WP15: the current task revision, for If-Match bindings.
+    pub fn revision_of(&self, task_id: &str) -> u64 {
+        self.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["task"]["revision"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// WP15: approve like a real client — send the CURRENT revision (If-Match)
+    /// and the previewed writer-body digest.
+    pub fn approve_current(&self, task_id: &str, hash: &str) -> Result<Value, (u16, Value)> {
+        let rev = self.revision_of(task_id);
+        let digest = self.relay_digest(task_id, None, None);
+        self.req_with_if_match(
+            "POST",
+            &format!("/v1/tasks/{task_id}/plan/approve"),
+            Some(&json!({"summary_hash": hash, "handoff_digest": digest})),
+            Some(&format!("test-approve-{}", &new_token()[..12])),
+            rev,
+        )
+    }
+
+    pub fn req_with_if_match(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        idem: Option<&str>,
+        revision: u64,
+    ) -> Result<Value, (u16, Value)> {
+        let mut r = ureq_request(method, &format!("{}{}", self.base(), path))
+            .timeout(Duration::from_secs(60))
+            .set("Authorization", "Bearer test-token")
+            .set("If-Match", &format!("\"{revision}\""));
+        if method != "GET" {
+            r = r
+                .set("X-CSRF-Token", "test-csrf")
+                .set("Origin", &self.base());
+        }
+        if let Some(k) = idem {
+            r = r.set("Idempotency-Key", k);
+        }
+        let resp = match body {
+            Some(b) => r.send_json(b.clone()),
+            None => r.call(),
+        };
+        match resp {
+            Ok(r) => r
+                .into_json::<Value>()
+                .map_err(|e| (500, json!({"error": {"code": "bad_json", "message": e.to_string()}}))),
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                let v = serde_json::from_str(&body).unwrap_or(Value::Null);
+                Err((code, v))
+            }
+            Err(e) => Err((0, json!({"error": {"code": "transport", "message": e.to_string()}}))),
+        }
+    }
 
     pub fn plan_hash(&self, task_id: &str) -> String {
         self.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"]["summary_hash"]
@@ -349,7 +420,7 @@ impl TestEnv {
         }
         let hash = plan["plan"]["summary_hash"].as_str().unwrap().to_string();
         if approve {
-            self.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
+            self.approve_current(&task_id, &hash).expect("approve");
         }
         (task_id, hash)
     }
@@ -381,7 +452,7 @@ impl TestEnv {
             self.core.store.meta_set(&format!("fake_script:{}:s1", task_id), &s.to_string());
         }
         let hash = plan["plan"]["summary_hash"].as_str().unwrap().to_string();
-        self.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
+        self.approve_current(&task_id, &hash).expect("approve");
         (task_id, hash)
     }
 

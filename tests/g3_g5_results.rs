@@ -39,13 +39,19 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
         "old writer stop confirmed"
     );
 
+    // make claude user-allowed so this probe reaches the capability gate (rather
+    // than being refused earlier as target_not_allowed)
+    let mut t = env.core.store.get_task(&task_id).unwrap();
+    t.allowed_adapters = vec!["fake".into(), "claude".into()];
+    env.core.store.update_task(&t).unwrap();
     // rerouting to an adapter that has NOT passed the independent write gate must be refused
     let err = env
-        .req(
+        .req_with_if_match(
             "POST",
             &format!("/v1/tasks/{task_id}/reroute"),
             Some(&json!({"target_adapter": "claude", "handoff_digest": "dummy-digest"})),
             Some("rr-claude"),
+            env.revision_of(&task_id),
         )
         .unwrap_err();
     assert_eq!(err.1["error"]["code"], json!("write_gate_failed"),
@@ -57,12 +63,12 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
     assert_eq!(rr["receipt"]["request_id"], json!("rr-fake"));
     let snap2 = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
     assert!(
-        snap2["events"]
+        !snap2["events"]
             .as_array()
             .unwrap()
             .iter()
             .any(|e| e["kind"] == json!("reroute_started")),
-        "reroute_started emitted for the flight layer"
+        "queueing must not publish reroute_started before launch evidence"
     );
 
     // relay attempt completes from the checkpoint
@@ -83,6 +89,19 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
     // no repeated write of the original attempt: generation 2 attempt is the only writer after stop
     let writer_launches = attempts.iter().filter(|a| a["role"] == json!("writer")).count();
     assert_eq!(writer_launches, 2);
+    let reroutes: Vec<&serde_json::Value> = snap["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == json!("reroute_started"))
+        .collect();
+    assert_eq!(reroutes.len(), 1, "the flight layer gets one event after the relay launched");
+    assert_eq!(
+        reroutes[0]["attempt_id"], attempts[1]["attempt_id"],
+        "reroute_started carries the real relay attempt id"
+    );
+    assert_eq!(reroutes[0]["payload"]["target"], json!("fake"));
+    assert_eq!(reroutes[0]["payload"]["simulated"], json!(true));
 }
 
 #[test]
