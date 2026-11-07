@@ -170,7 +170,7 @@ function useSse(onEvent: (ev: any) => void) {
     const connect = () => {
       if (closed) return;
       es = new EventSource("/v1/events");
-      es.onmessage = (m) => {
+      const handle = (m: MessageEvent) => {
         try {
           const data = JSON.parse(m.data);
           if (data.seq <= lastSeq) return; // dedupe by seq
@@ -180,6 +180,26 @@ function useSse(onEvent: (ev: any) => void) {
           /* ignore */
         }
       };
+      // The server names each SSE event after its kind, so named listeners are
+      // required; EventSource.onmessage only receives unnamed events. Without
+      // these, persisted departures never reached the flight layer.
+      es.onmessage = handle;
+      for (const kind of [
+        "attempt_prepared",
+        "attempt_started",
+        "reroute_started",
+        "result_collected",
+        "inbox_updated",
+        "candidate_accepted",
+        "task_blocked",
+        "decision_opened",
+        "decision_answered",
+        "cancel_requested",
+        "attempt_failed",
+        "attempt_cancelled",
+      ]) {
+        es.addEventListener(kind, handle as EventListener);
+      }
       es.onerror = () => {
         es?.close();
         window.setTimeout(connect, 2000);
@@ -307,7 +327,7 @@ function App() {
         }
       }
     }
-    if (ev.kind === "inbox_updated" || ev.kind === "attempt_started" || ev.kind === "result_collected" || ev.kind === "candidate_accepted" || ev.kind === "task_blocked") {
+    if (ev.kind === "inbox_updated" || ev.kind === "attempt_prepared" || ev.kind === "attempt_started" || ev.kind === "result_collected" || ev.kind === "candidate_accepted" || ev.kind === "task_blocked") {
       refreshTasks();
     }
   });

@@ -1133,11 +1133,15 @@ Sample repository for the offline wagglepost tour.
             self.store.meta_set(&format!("next_step:{}", task_id), "");
         }
         self.store.resolve_message_by_task(task_id, "blocked");
+        // WP14b: this is only the persisted launch intent / prepared workspace.
+        // It is NOT runtime evidence, so it must never trigger the departure
+        // animation; the real runtime handshake (agent_started) promotes the
+        // attempt to running and publishes attempt_started or reroute_started.
         self.bus.emit(
             Some(task_id),
             Some(&attempt.attempt_id),
             generation,
-            "attempt_started",
+            "attempt_prepared",
             json!({
                 "attempt_id": attempt.attempt_id,
                 "adapter": attempt.adapter,
@@ -1146,6 +1150,7 @@ Sample repository for the offline wagglepost tour.
                 "simulated": attempt.simulated,
                 "launch_no": attempt.launch_no,
                 "worktree": wt.worktree_id,
+                "status": "starting",
             }),
         );
 
@@ -1486,24 +1491,25 @@ failure_location: cp
             Some(a) => a,
             None => return,
         };
-        let mut a = attempt;
-        a.status = AttemptStatus::Running;
-        let _ = self.store.update_attempt(&a);
-        let mut t = match self.store.get_task(task_id) {
-            Some(t) => t,
-            None => return,
-        };
-        if t.status == TaskStatus::Starting {
-            t.status = TaskStatus::Running;
-            t.updated_at = timestamp();
-            let _ = self.store.update_task(&t);
-        }
+        // Launch intent is already persisted as Starting by dispatch. Keep it
+        // there: a process that dies before its runtime handshake never becomes
+        // Running and never publishes a departure event.
+        let start_payload = json!({
+            "attempt_id": attempt.attempt_id.clone(),
+            "adapter": attempt.adapter.clone(),
+            "role": attempt.role.as_str(),
+            "generation": ctx.generation,
+            "simulated": attempt.simulated,
+            "launch_no": attempt.launch_no,
+            "worktree": attempt.worktree_id.clone(),
+        });
 
         let generation = ctx.generation;
         let attempt_id2 = attempt_id.to_string();
         let bus = self.bus.clone();
+        let core_for_start = self.clone();
         let relay = ctx.relay.clone();
-        let relay_announced = Arc::new(AtomicBool::new(false));
+        let started_announced = Arc::new(AtomicBool::new(false));
         let seen_keys: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let on_event = move |ev: &WireEvent| {
@@ -1525,29 +1531,18 @@ failure_location: cp
                 &ev.kind,
                 ev.payload.clone(),
             );
-            // WP14: a real runtime has now started (agent_started). This is the
-            // only place a reroute is announced, with the actual attempt id and
-            // the actually launched target — never the request id, never at queue.
-            if ev.kind == "agent_started" {
-                if let Some(r) = &relay {
-                    if !relay_announced.swap(true, Ordering::SeqCst) {
-                        bus.emit(
-                            Some(task_id),
-                            Some(&attempt_id2),
-                            generation,
-                            "reroute_started",
-                            json!({
-                                "attempt_id": attempt_id2,
-                                "target": r.target,
-                                "checkpoint": r.checkpoint_id,
-                                "adapter_version": r.adapter_version,
-                                "handoff_digest": r.handoff_digest,
-                                "generation": generation,
-                                "simulated": r.target == "fake",
-                            }),
-                        );
-                    }
-                }
+            // WP14b: only a real runtime handshake promotes the attempt and
+            // publishes a departure. A normal attempt gets attempt_started; an
+            // approved relay gets ONLY reroute_started so the UI does not play a
+            // normal dispatch first.
+            if ev.kind == "agent_started" && !started_announced.swap(true, Ordering::SeqCst) {
+                core_for_start.note_agent_started(
+                    task_id,
+                    &attempt_id2,
+                    generation,
+                    &start_payload,
+                    relay.as_ref(),
+                );
             }
         };
 
@@ -1559,6 +1554,62 @@ failure_location: cp
             }
             Err(e) => {
                 self.mark_attempt_failed(attempt_id, &e);
+            }
+        }
+    }
+
+    /// Promote a persisted launch intent to a real run only after the adapter's
+    /// handshake. A cancel/stop that landed first wins: it must not be overwritten
+    /// by a late agent_started from the process tree.
+    fn note_agent_started(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        start_payload: &serde_json::Value,
+        relay: Option<&adapters::RelayIntent>,
+    ) {
+        let Some(mut a) = self.store.get_attempt(attempt_id) else {
+            return;
+        };
+        let Some(mut t) = self.store.get_task(task_id) else {
+            return;
+        };
+        if a.status != AttemptStatus::Starting || t.status != TaskStatus::Starting {
+            return;
+        }
+        a.status = AttemptStatus::Running;
+        t.status = TaskStatus::Running;
+        t.updated_at = timestamp();
+        if self.store.update_attempt(&a).is_err() || self.store.update_task(&t).is_err() {
+            return;
+        }
+        match relay {
+            Some(r) => {
+                self.bus.emit(
+                    Some(task_id),
+                    Some(attempt_id),
+                    generation,
+                    "reroute_started",
+                    json!({
+                        "attempt_id": attempt_id,
+                        "target": r.target,
+                        "checkpoint": r.checkpoint_id,
+                        "adapter_version": r.adapter_version,
+                        "handoff_digest": r.handoff_digest,
+                        "generation": generation,
+                        "simulated": r.target == "fake",
+                    }),
+                );
+            }
+            None => {
+                self.bus.emit(
+                    Some(task_id),
+                    Some(attempt_id),
+                    generation,
+                    "attempt_started",
+                    start_payload.clone(),
+                );
             }
         }
     }

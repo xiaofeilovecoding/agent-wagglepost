@@ -183,6 +183,23 @@ fn wp14_reroute_target_override_launches_the_approved_runtime() {
         !snap["events"].as_array().unwrap().iter().any(|e| e["kind"] == json!("reroute_started")),
         "a failed launch must not broadcast the reroute event"
     );
+    let failed_aid = second["attempt_id"].as_str().unwrap();
+    assert!(
+        !snap["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == json!("attempt_started") && e["attempt_id"] == json!(failed_aid)),
+        "a failed relay launch must not broadcast a normal departure either"
+    );
+    assert!(
+        snap["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == json!("attempt_prepared") && e["attempt_id"] == json!(failed_aid)),
+        "the failed relay still records its prepared intent"
+    );
 
     // control: the SAME two-fixture task rerouted to fake launches fake and
     // publishes exactly ONE reroute_started with the REAL attempt id + target
@@ -222,7 +239,121 @@ fn wp14_reroute_target_override_launches_the_approved_runtime() {
     assert_eq!(reroutes.len(), 1, "exactly one reroute event, published after launch evidence");
     assert_eq!(reroutes[0]["attempt_id"], second2["attempt_id"], "event carries the REAL attempt id");
     assert_eq!(reroutes[0]["payload"]["target"], json!("fake"), "event names the actually launched target");
+    let relay_aid = second2["attempt_id"].as_str().unwrap();
+    assert!(
+        !snap2["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == json!("attempt_started") && e["attempt_id"] == json!(relay_aid)),
+        "a relay launch must not first play the normal dispatch direction"
+    );
+    let first_aid = snap2["attempts"].as_array().unwrap()[0]["attempt_id"].as_str().unwrap();
+    assert!(
+        snap2["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == json!("attempt_started") && e["attempt_id"] == json!(first_aid)),
+        "the original normal launch still has its departure"
+    );
     let _ = (&env, &env2);
+}
+
+#[test]
+fn wp14b_no_handshake_never_announces_departure() {
+    // The approved codex target answers --version normally but its real launch
+    // exits 73 without emitting agent_started. The persisted launch intent must
+    // not be mistaken for a running attempt or a departure animation.
+    let env = TestEnv::new_with_cfg(|cfg| {
+        let stub = cfg.managed_root.join("codex-no-handshake.cmd");
+        std::fs::write(
+            &stub,
+            "@echo off\r\nif /i \"%1\"==\"--version\" (\r\n  echo codex-cli 99.0.0-review-fixture\r\n  exit /b 0\r\n)\r\nexit /b 73\r\n",
+        )
+        .unwrap();
+        cfg.codex_exe = stub;
+        cfg.codex_version = Some("codex-cli 99.0.0-review-fixture".into());
+    });
+    let body = json!({
+        "goal": "no-handshake codex fixture (offline simulated)",
+        "repo_path": env.user_repo.to_string_lossy(),
+        "recipe": "direct",
+        "allowed_adapters": ["codex"],
+        "writer_adapter": "codex",
+    });
+    let resp = env.req("POST", "/v1/tasks", Some(&body), Some("wp14b-sub")).expect("submit");
+    let task_id = resp["task"]["task_id"].as_str().unwrap().to_string();
+    env.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).expect("trust");
+    let plan = env
+        .req(
+            "POST",
+            &format!("/v1/tasks/{task_id}/plan"),
+            Some(&json!({"writer_adapter": "codex"})),
+            None,
+        )
+        .expect("plan");
+    env.approve_current(&task_id, plan["plan"]["summary_hash"].as_str().unwrap()).expect("approve");
+    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp14b-d")).expect("dispatch");
+    let status = env.run_until(&task_id, &["interrupted", "failed"], Duration::from_secs(60));
+    assert_eq!(status, "interrupted");
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    let attempt = &snap["attempts"].as_array().unwrap()[0];
+    let aid = attempt["attempt_id"].as_str().unwrap();
+    assert_eq!(attempt["status"], json!("failed"));
+    assert_eq!(attempt["exit_code"], json!(73));
+    assert_eq!(snap["task"]["launches_used"], json!(1), "failed real launch still counts");
+    let events = snap["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|e| e["kind"] == json!("attempt_prepared") && e["attempt_id"] == json!(aid)),
+        "the prepared intent is visible as its own event"
+    );
+    assert!(
+        !events.iter().any(|e| e["kind"] == json!("agent_started")),
+        "the stub never emitted a handshake"
+    );
+    assert!(
+        !events.iter().any(|e| e["kind"] == json!("attempt_started")),
+        "no departure without runtime evidence"
+    );
+    assert!(
+        !events.iter().any(|e| e["kind"] == json!("reroute_started")),
+        "no reroute departure without runtime evidence"
+    );
+}
+
+#[test]
+fn wp14b_normal_success_has_exactly_one_departure() {
+    let env = TestEnv::new();
+    let (task_id, _) = env.ready_task(
+        "direct",
+        Some("fake"),
+        Some(json!({
+            "behaviors": ["write_files"],
+            "files": {"ok.txt": "ok\n"},
+            "result": {"status": "done", "summary": "done (simulated)"}
+        })),
+    );
+    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp14b-ok"))
+        .expect("dispatch");
+    let status = env.run_until(&task_id, &["needs_review"], Duration::from_secs(60));
+    assert_eq!(status, "needs_review");
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+    let events = snap["events"].as_array().unwrap();
+    assert_eq!(
+        events.iter().filter(|e| e["kind"] == json!("attempt_started")).count(),
+        1,
+        "normal success publishes exactly one departure"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e["kind"] == json!("reroute_started")).count(),
+        0,
+        "normal success has no reroute direction"
+    );
+    assert!(
+        events.iter().any(|e| e["kind"] == json!("attempt_prepared")),
+        "prepared intent is recorded before the handshake"
+    );
 }
 
 #[test]
