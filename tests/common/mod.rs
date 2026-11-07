@@ -19,6 +19,10 @@ pub struct TestEnv {
     pub core: Arc<Core>,
     pub managed_root: PathBuf,
     pub user_repo: PathBuf,
+    /// Dedicated agent with connection pooling disabled. Reusing an idle HTTP/1.1
+    /// socket across a blocking scheduler tick produced transient Windows 10053
+    /// status-line aborts on CI; a fresh connection per request is deterministic.
+    pub agent: ureq::Agent,
     _guard: Option<tempdir_guard::Guard>,    _lock: Option<wagglepost::instance_lock::InstanceGuard>,
 }
 
@@ -133,6 +137,11 @@ impl TestEnv {
         core.store.meta_set("startup_code", &startup_code);
         // the in-process server IS a real instance: hold the managed-root lock (WP06)
         let lock = wagglepost::instance_lock::acquire(&managed).expect("instance lock");
+        let agent = ureq::AgentBuilder::new()
+            .max_idle_connections(0)
+            .max_idle_connections_per_host(0)
+            .timeout(Duration::from_secs(60))
+            .build();
         Arc::new(TestEnv {
             port,
             token: "test-token".into(),
@@ -142,6 +151,7 @@ impl TestEnv {
             core,
             managed_root: managed,
             user_repo,
+            agent,
             _lock: Some(lock),
             _guard: Some(tempdir_guard::Guard(root)),
         })
@@ -158,8 +168,9 @@ impl TestEnv {
         body: Option<&Value>,
         idem: Option<&str>,
     ) -> Result<Value, (u16, Value)> {
-        let mut r = ureq_request(method, &format!("{}{}", self.base(), path))
+        let mut r = agent_request(&self.agent, method, &format!("{}{}", self.base(), path))
             .timeout(Duration::from_secs(60))
+            .set("Connection", "close")
             .set("Authorization", "Bearer test-token");
         if method != "GET" {
             r = r
@@ -182,7 +193,14 @@ impl TestEnv {
                 let v: Value = r.into_json().unwrap_or(Value::Null);
                 Err((code, v))
             }
-            Err(e) => panic!("request failed: {e}"),
+            Err(e) => {
+                if std::env::var_os("WAGGLEPOST_TEST_HTTP_DIAG").is_some() {
+                    // Test-only, no bodies/tokens: enough to tell stale connection
+                    // (method/path/transport) from a server-side semantic failure.
+                    eprintln!("[test-http] {method} {path}: {e}");
+                }
+                panic!("request failed: {e}")
+            }
         }
     }
 
@@ -194,8 +212,9 @@ impl TestEnv {
         body: Option<&Value>,
         headers: &[(&str, &str)],
     ) -> Result<Value, (u16, Value)> {
-        let mut r = ureq_request(method, &format!("{}{}", self.base(), path))
-            .timeout(Duration::from_secs(60));
+        let mut r = agent_request(&self.agent, method, &format!("{}{}", self.base(), path))
+            .timeout(Duration::from_secs(60))
+            .set("Connection", "close");
         for (k, v) in headers {
             r = r.set(k, v);
         }
@@ -212,7 +231,14 @@ impl TestEnv {
                 let v: Value = r.into_json().unwrap_or(Value::Null);
                 Err((code, v))
             }
-            Err(e) => panic!("request failed: {e}"),
+            Err(e) => {
+                if std::env::var_os("WAGGLEPOST_TEST_HTTP_DIAG").is_some() {
+                    // Test-only, no bodies/tokens: enough to tell stale connection
+                    // (method/path/transport) from a server-side semantic failure.
+                    eprintln!("[test-http] {method} {path}: {e}");
+                }
+                panic!("request failed: {e}")
+            }
         }
     }
 
@@ -366,8 +392,9 @@ impl TestEnv {
         idem: Option<&str>,
         revision: u64,
     ) -> Result<Value, (u16, Value)> {
-        let mut r = ureq_request(method, &format!("{}{}", self.base(), path))
+        let mut r = agent_request(&self.agent, method, &format!("{}{}", self.base(), path))
             .timeout(Duration::from_secs(60))
+            .set("Connection", "close")
             .set("Authorization", "Bearer test-token")
             .set("If-Match", &format!("\"{revision}\""));
         if method != "GET" {
@@ -520,12 +547,12 @@ impl TestEnv {
     }
 }
 
-fn ureq_request(method: &str, url: &str) -> ureq::Request {
+fn agent_request(agent: &ureq::Agent, method: &str, url: &str) -> ureq::Request {
     match method {
-        "POST" => ureq::post(url),
-        "PUT" => ureq::put(url),
-        "DELETE" => ureq::delete(url),
-        _ => ureq::get(url),
+        "POST" => agent.post(url),
+        "PUT" => agent.put(url),
+        "DELETE" => agent.delete(url),
+        _ => agent.get(url),
     }
 }
 
