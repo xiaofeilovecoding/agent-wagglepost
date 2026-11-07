@@ -689,7 +689,16 @@ function TaskView({
         const r = await api.dispatch(task.task_id, randomIdem("web-disp"));
         showToast(`${t("dispatched", lang)} · ${r.receipt?.attempt_id ?? ""}`);
       } else if (status === "waiting_decision" && decision && decisionChoice) {
-        const r = await api.answer(decision.decision_id, decisionChoice, task.revision, randomIdem("web-ans"));
+        // WP09: the resume body must be previewed (with the chosen option applied)
+        // and its digest approved before queueing
+        const prev = await api.handoffPreview(task.task_id, "writer", decision.decision_id, decisionChoice);
+        const r = await api.answer(
+          decision.decision_id,
+          decisionChoice,
+          task.revision,
+          prev.approved_digest,
+          randomIdem("web-ans"),
+        );
         showToast(t("decisionQueued", lang));
       } else if (next === "reconcile") {
         const info = await api.request(attempts[attempts.length - 1]?.request_id || task.task_id);

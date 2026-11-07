@@ -690,10 +690,11 @@ fn wp10_reroute_budget_disclosure_and_no_extra_launch() {
     let dbg = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
     assert_eq!(dbg["reviews"][0]["verdict"], json!("issues"), "issues verdict needed for eligibility");
     println!("[w10] status={} launches={}", dbg["task"]["status"], dbg["task"]["launches_used"]);
+    let digest = env.relay_digest(&task_id, None, None);
     let err = env.req(
         "POST",
         &format!("/v1/tasks/{task_id}/reroute"),
-        Some(&json!({"target_adapter": "fake"})),
+        Some(&json!({"target_adapter": "fake", "handoff_digest": digest})),
         Some("wp10-rr"),
     ).unwrap_err();
     println!("[w10] reroute error: {}", err.1["error"]);
@@ -727,7 +728,7 @@ fn wp10_reroute_budget_disclosure_and_no_extra_launch() {
         assert!(start.elapsed() < Duration::from_secs(60), "review never recorded");
         std::thread::sleep(Duration::from_millis(200));
     }
-    env.req("POST", &format!("/v1/tasks/{t2}/reroute"), Some(&json!({"target_adapter": "fake"})), Some("wp10-rr2")).expect("reroute within disclosed budget");
+    env.reroute_queued(&t2, "fake", "wp10-rr2");
     env.set_fake_script(&t2, "s1", &json!({
         "behaviors": ["write_files"],
         "files": {"lib.txt": "baseline content\nA2 (simulated)\nB2 (simulated)\n"},

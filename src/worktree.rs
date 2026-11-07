@@ -334,7 +334,7 @@ pub fn is_clean(cfg: &GitConfig, repo: &str) -> Result<bool, String> {
     // compare counts and content hashes coarsely; a full index comparison is expensive,
     // so combine with diff --quiet which does not run clean filters (no worktree writes)
     let diffq = std::process::Command::new(&cfg.git_exe)
-        .args(["diff", "--quiet", "HEAD"])
+        .args(["diff", "--quiet", "--no-textconv", "--no-ext-diff", "HEAD"])
         .current_dir(repo)
         .env_clear()
         .envs(git_min_env())
@@ -422,7 +422,7 @@ pub fn observe_worktree(cfg: &GitConfig, worktree_path: &str) -> Result<Worktree
             changed.push(path_str);
         }
     }
-    let diff = run_git(cfg, p, &["diff", "HEAD", "--binary"], None)?;
+    let diff = run_git(cfg, p, &["diff", "--no-textconv", "--no-ext-diff", "HEAD", "--binary"], None)?;
     Ok(WorktreeObservation {
         changed_files: changed,
         untracked_files: untracked,
@@ -520,14 +520,14 @@ pub fn freeze_candidate(
     let patch = run_git(
         cfg,
         p,
-        &["diff", "--binary", &task.base_commit, &commit],
+        &["diff", "--no-textconv", "--no-ext-diff", "--binary", &task.base_commit, &commit],
         None,
     )?;
     // full change enumeration from the frozen tree (WP03): added/deleted/renamed/modified
     let name_status = run_git(
         cfg,
         p,
-        &["diff", "--name-status", "-M", &task.base_commit, &commit],
+        &["diff", "--no-textconv", "--no-ext-diff", "--name-status", "-M", &task.base_commit, &commit],
         None,
     )?;
     let mut changed_files_full: Vec<String> = Vec::new();

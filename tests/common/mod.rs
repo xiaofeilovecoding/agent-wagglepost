@@ -235,6 +235,57 @@ impl TestEnv {
         self.startup_code_value.clone()
     }
 
+    /// WP09: fetch the relay-body digest the server will send for the next generation.
+    /// When a decision card is being answered, pass its id + chosen option so the
+    /// preview includes the exact answer line.
+    pub fn relay_digest(&self, task_id: &str, decision: Option<&str>, option: Option<&str>) -> String {
+        let mut path = format!("/v1/tasks/{task_id}/handoff-preview?role=writer");
+        if let (Some(d), Some(o)) = (decision, option) {
+            path.push_str(&format!("&decision={d}&option={o}"));
+        }
+        self.req("GET", &path, None, None).unwrap()["approved_digest"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// WP09: answer a decision card with the previewed body digest (save + queue).
+    pub fn answer_card(&self, task_id: &str, option_id: &str, idem: &str) -> Value {
+        let decisions = self.req("GET", "/v1/decisions?status=open", None, None).unwrap();
+        let card = decisions["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["task_id"] == json!(task_id))
+            .cloned()
+            .expect("open card for task");
+        let digest = self.relay_digest(task_id, Some(card["decision_id"].as_str().unwrap()), Some(option_id));
+        self.req(
+            "POST",
+            &format!("/v1/decisions/{}/answer", card["decision_id"].as_str().unwrap()),
+            Some(&json!({
+                "option_id": option_id,
+                "revision": card["revision"].as_u64().unwrap(),
+                "handoff_digest": digest,
+            })),
+            Some(idem),
+        )
+        .expect("answer with previewed digest")
+    }
+
+    /// WP09: reroute with the previewed relay body digest.
+    pub fn reroute_queued(&self, task_id: &str, target: &str, idem: &str) -> Value {
+        let digest = self.relay_digest(task_id, None, None);
+        self.req(
+            "POST",
+            &format!("/v1/tasks/{task_id}/reroute"),
+            Some(&json!({"target_adapter": target, "handoff_digest": digest})),
+            Some(idem),
+        )
+        .expect("reroute with previewed digest")
+    }
+
+
     pub fn plan_hash(&self, task_id: &str) -> String {
         self.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"]["summary_hash"]
             .as_str()

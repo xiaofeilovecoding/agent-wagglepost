@@ -44,7 +44,7 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
         .req(
             "POST",
             &format!("/v1/tasks/{task_id}/reroute"),
-            Some(&json!({"target_adapter": "claude"})),
+            Some(&json!({"target_adapter": "claude", "handoff_digest": "dummy-digest"})),
             Some("rr-claude"),
         )
         .unwrap_err();
@@ -53,14 +53,7 @@ fn g3_quota_block_then_reroute_same_adapter_simulated() {
     assert_eq!(err.0, 409);
 
     // rerouting to a gate-passing (simulated) writer is allowed and labeled simulated
-    let rr = env
-        .req(
-            "POST",
-            &format!("/v1/tasks/{task_id}/reroute"),
-            Some(&json!({"target_adapter": "fake"})),
-            Some("rr-fake"),
-        )
-        .unwrap();
+    let rr = env.reroute_queued(&task_id, "fake", "rr-fake");
     assert_eq!(rr["receipt"]["request_id"], json!("rr-fake"));
     let snap2 = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
     assert!(
@@ -150,13 +143,7 @@ fn g5_candidate_binding_review_and_accept() {
     assert_eq!(snap["reviews"][0]["verdict"], json!("issues"));
 
     // reroute (manual, after failed review) → candidate B from the checkpoint
-    env.req(
-        "POST",
-        &format!("/v1/tasks/{task_id}/reroute"),
-        Some(&json!({"target_adapter": "fake"})),
-        Some("b-reroute"),
-    )
-    .expect("reroute after failed review is eligible");
+    env.reroute_queued(&task_id, "fake", "b-reroute");
     env.set_fake_script(
         &task_id,
         "s1",

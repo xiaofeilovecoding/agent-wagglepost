@@ -610,7 +610,23 @@ async fn answer_decision(
     if rec.status == "completed" {
         return Json(rec.result).into_response();
     }
-    match state.core.answer_decision(&id, &option_id, revision, &mut rec) {
+    // WP09: an OPEN card requires the approved body digest; a duplicate (already
+    // answered) replays the original receipt without one
+    let approved_digest = body
+        .get("handoff_digest")
+        .and_then(|h| h.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(d) = state.core.store.get_decision(&id) {
+        if d.status == "open" && approved_digest.is_empty() {
+            return error_response(
+                StatusCode::CONFLICT,
+                "handoff_digest_required",
+                "the resume body must be previewed and approved: fetch the handoff preview and resend with its digest",
+            );
+        }
+    }
+    match state.core.answer_decision(&id, &option_id, revision, &approved_digest, &mut rec) {
         Ok((d, task)) => {
             let receipt = routing::build_receipt(&request_id, &task, Some(&d.attempt_id), true);
             let result = json!({"receipt": receipt, "decision": d, "queued": true});
@@ -656,7 +672,20 @@ async fn reroute(
     if rec.status == "completed" {
         return Json(rec.result).into_response();
     }
-    match state.core.reroute(&id, &target, &mut rec) {
+    // WP09 weekend: the relay body must be previewed and approved before queueing
+    let approved_digest = body
+        .get("handoff_digest")
+        .and_then(|h| h.as_str())
+        .unwrap_or("")
+        .to_string();
+    if approved_digest.is_empty() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "handoff_digest_required",
+            "the relay body must be previewed and approved: fetch the handoff preview and resend with its digest",
+        );
+    }
+    match state.core.reroute(&id, &target, &approved_digest, &mut rec) {
         Ok(t) => {
             let receipt = routing::build_receipt(&request_id, &t, None, false);
             let result = json!({"receipt": receipt});
@@ -742,7 +771,16 @@ async fn handoff_preview(
         return error_response(StatusCode::NOT_FOUND, "not_found", "no such step");
     };
     let generation = task.current_generation + 1;
-    match state.core.assemble_handoff(&task, step, generation) {
+    let pending = match (q.get("decision"), q.get("option")) {
+        (Some(d), Some(o)) => Some((d.as_str(), o.as_str())),
+        _ => None,
+    };
+    let relay_cp = if step.role == crate::model::Role::Writer && generation > 1 {
+        state.core.checkpoint_view(&task)
+    } else {
+        None
+    };
+    match state.core.assemble_handoff(&task, step, generation, pending, relay_cp) {
         Ok(h) => Json(json!({
             "handoff": {
                 "text": h.text, "bytes": h.bytes, "sha256": h.sha256,

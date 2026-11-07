@@ -47,12 +47,17 @@ export const api = {
   approve: (id: string, hash: string) => call("POST", `/v1/tasks/${id}/plan/approve`, { summary_hash: hash }),
   routePreview: (id: string, role: string) => call("GET", `/v1/tasks/${id}/route-preview?role=${role}`),
   dispatch: (id: string, idem: string) => call("POST", `/v1/tasks/${id}/dispatch`, {}, idem),
-  handoffPreview: (id: string, role: string) => call("GET", `/v1/tasks/${id}/handoff-preview?role=${role}`),
+  handoffPreview: (id: string, role: string, decision?: string, option?: string) =>
+    call(
+      "GET",
+      `/v1/tasks/${id}/handoff-preview?role=${role}` +
+        (decision && option ? `&decision=${decision}&option=${option}` : ""),
+    ),
   diff: (id: string) => call("GET", `/v1/tasks/${id}/diff`),
   cancel: (attempt: string, idem: string) => call("POST", `/v1/attempts/${attempt}/cancel`, {}, idem),
   decisions: (open: boolean) => call("GET", `/v1/decisions?status=${open ? "open" : "all"}`),
-  answer: (decision: string, option: string, revision: number, idem: string) =>
-    call("POST", `/v1/decisions/${decision}/answer`, { option_id: option, revision }, idem),
+  answer: (decision: string, option: string, revision: number, digest: string, idem: string) =>
+    call("POST", `/v1/decisions/${decision}/answer`, { option_id: option, revision, handoff_digest: digest }, idem),
   reroute: (id: string, target: string, idem: string) => call("POST", `/v1/tasks/${id}/reroute`, { target_adapter: target }, idem),
   accept: (id: string, candidate: string, idem: string) => call("POST", `/v1/tasks/${id}/accept`, { candidate_hash: candidate }, idem),
   resumeOptions: (id: string) => call("GET", `/v1/resume-options/${id}`),

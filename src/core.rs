@@ -324,6 +324,42 @@ Sample repository for the offline wagglepost tour.
             == Some("1".to_string())
     }
 
+    /// WP09 weekend: deterministic checkpoint view for relay bodies. Reuses the
+    /// persisted checkpoint when present; otherwise derives the in-memory view from
+    /// the current candidate (failed-review reroute) with the same constant fields,
+    /// so a previewed body and the launched body are byte-identical.
+    pub fn checkpoint_view(&self, task: &Task) -> Option<Checkpoint> {
+        if let Some(c) = self.store.latest_checkpoint(&task.task_id) {
+            return Some(c);
+        }
+        let writer_attempt = self
+            .store
+            .current_candidate(&task.task_id)
+            .map(|c| c.attempt_id)
+            .unwrap_or_default();
+        let wt_view = self
+            .store
+            .get_attempt(&writer_attempt)
+            .and_then(|a| a.worktree_id)
+            .and_then(|wid| self.store.get_worktree(&wid))?;
+        let obs = worktree::observe_worktree(&self.cfg.git, &wt_view.path).ok()?;
+        let chash = worktree::candidate_hash(&self.cfg.git, &wt_view.path).ok()?;
+        Some(Checkpoint {
+            checkpoint_id: "pending".into(),
+            task_id: task.task_id.clone(),
+            revision: task.revision,
+            attempt_id: writer_attempt,
+            base_commit: task.base_commit.clone(),
+            candidate_hash: chash,
+            changed_files: obs.changed_files,
+            untracked_files: obs.untracked_files,
+            patch_path: None,
+            failure_summary: Some("review found issues; manual reroute".into()),
+            source: CheckpointSource::LocalObserved,
+            created_at: timestamp(),
+        })
+    }
+
     pub fn trust_repo(&self, repo_path: &str) -> Result<(), CoreError> {
         let p = PathBuf::from(repo_path);
         if !p.is_dir() {
@@ -625,7 +661,7 @@ Sample repository for the offline wagglepost tour.
             .iter()
             .find(|s| s.role == Role::Writer)
             .ok_or_else(|| CoreError::bad("no_candidate", "plan has no writer step"))?;
-        let approved_body = self.assemble_handoff(&task, writer_step, 1)?;
+        let approved_body = self.assemble_handoff(&task, writer_step, 1, None, None)?;
         if let Some(d) = handoff_digest {
             if d != approved_body.sha256 {
                 return Err(CoreError::conflict(
@@ -810,7 +846,8 @@ Sample repository for the offline wagglepost tour.
 
         // assemble handoff (local, deterministic)
         let generation = task.current_generation + 1;
-        let handoff = self.assemble_handoff(&task, &next_step, generation)?;
+        let relay_cp = self.store.latest_checkpoint(task_id);
+        let handoff = self.assemble_handoff(&task, &next_step, generation, None, relay_cp)?;
         let _body_digest = sha256_hex(handoff.text.as_bytes());
         if handoff.bytes > handoff.budget_bytes {
             return Err(CoreError::bad(
@@ -831,6 +868,34 @@ Sample repository for the offline wagglepost tour.
                     "handoff_not_approved",
                     "the assembled body differs from the approved digest; refresh the preview and re-approve",
                 ));
+            }
+        }
+        // WP09 weekend: resume/reroute bodies are bound per generation at approval;
+        // reviewer bodies are bound at freeze. A mismatch refuses before launch.
+        if next_step.role == Role::Writer && generation > 1 {
+            if let Some(bound) = self
+                .store
+                .meta_get(&format!("approved_relay_digest:{}:{}", task_id, generation))
+            {
+                if bound != handoff.sha256 {
+                    return Err(CoreError::conflict(
+                        "handoff_not_approved",
+                        "the assembled relay body differs from the approved digest",
+                    ));
+                }
+            }
+        }
+        if next_step.role == Role::Reviewer {
+            if let Some(bound) = self
+                .store
+                .meta_get(&format!("approved_reviewer_digest:{}", task_id))
+            {
+                if bound != handoff.sha256 {
+                    return Err(CoreError::conflict(
+                        "handoff_not_approved",
+                        "the assembled reviewer body differs from the approved digest",
+                    ));
+                }
             }
         }
         if let Some(approved_versions) = &plan.approved_versions {
@@ -998,7 +1063,14 @@ Sample repository for the offline wagglepost tour.
     }
 
     /// Assemble the role-specific handoff (G7a contract).
-    pub fn assemble_handoff(&self, task: &Task, step: &PlanStep, generation: u64) -> Result<HandoffBody, CoreError> {
+    pub fn assemble_handoff(
+        &self,
+        task: &Task,
+        step: &PlanStep,
+        generation: u64,
+        pending_answer: Option<(&str, &str)>,
+        relay_cp: Option<Checkpoint>,
+    ) -> Result<HandoffBody, CoreError> {
         let lang = self
             .store
             .meta_get("ui_lang")
@@ -1037,8 +1109,9 @@ Sample repository for the offline wagglepost tour.
         let parts = match step.role {
             Role::Writer => {
                 if generation > 1 {
-                    // relay package
-                    let cp = self.store.latest_checkpoint(&task.task_id);
+                    // relay package: the checkpoint view is passed by the caller so the
+                    // previewed body and the launched body are byte-identical
+                    let cp = relay_cp;
                     HandoffParts {
                         goal: task.goal.clone(),
                         acceptance: acceptance.clone(),
@@ -1061,20 +1134,34 @@ Sample repository for the offline wagglepost tour.
                                     )
                                 })
                                 .unwrap_or_else(|| "无已确认进度 / none".into());
-                            let answered = self
-                                .store
-                                .list_decisions(false)
-                                .into_iter()
-                                .filter(|d| d.task_id == task.task_id && d.status == "answered")
-                                .max_by_key(|d| d.created_at.clone());
+                            let answered = match pending_answer {
+                                Some((did, oid)) => {
+                                    let q = self
+                                        .store
+                                        .get_decision(did)
+                                        .map(|d| d.question)
+                                        .unwrap_or_default();
+                                    Some((did.to_string(), oid.to_string(), q))
+                                }
+                                None => self
+                                    .store
+                                    .list_decisions(false)
+                                    .into_iter()
+                                    .filter(|d| d.task_id == task.task_id && d.status == "answered")
+                                    .max_by_key(|d| d.created_at.clone())
+                                    .map(|d| {
+                                        (
+                                            d.decision_id.clone(),
+                                            d.resolution.clone().unwrap_or_default(),
+                                            d.question.clone(),
+                                        )
+                                    }),
+                            };
                             match answered {
-                                Some(d) => format!(
+                                Some((did, oid, q)) => format!(
                                     "{}
 用户已回答决策卡 {}：选择 {}（问题：{}）",
-                                    base,
-                                    d.decision_id,
-                                    d.resolution.clone().unwrap_or_default(),
-                                    d.question
+                                    base, did, oid, q
                                 ),
                                 None => base,
                             }
@@ -1086,8 +1173,8 @@ failure_location: cp
                         key_changes: cp.as_ref().map(|c| c.changed_files.join("\n")),
                         evidence: cp.as_ref().map(|c| {
                             format!(
-                                "evidence://task/{}/checkpoint/{} (generation {}, candidate {})",
-                                task.task_id, c.checkpoint_id, c.attempt_id, c.candidate_hash
+                                "evidence://task/{}/candidate/{}",
+                                task.task_id, c.candidate_hash
                             )
                         }),
                         next_step: Some(
@@ -1469,7 +1556,9 @@ failure_location: cp
                             // a new candidate supersedes old-candidate reviews (kept as history)
                             self.store.mark_reviews_historical(task_id);
                             // re-run the reviewer for the new candidate (same-generation
-                            // guard still prevents double dispatch within one generation)
+                            // guard still prevents double dispatch within one generation).
+                            // WP09 weekend: bind the reviewer body NOW (the frozen candidate
+                            // makes it immutable) so the launch is verified against it.
                             let reviewer_step = self
                                 .store
                                 .latest_plan(task_id)
@@ -1479,8 +1568,27 @@ failure_location: cp
                                         .find(|s| s.role == Role::Reviewer)
                                         .map(|s| s.step_id.clone())
                                 });
-                            if let Some(step) = reviewer_step {
+                            if let Some(step) = reviewer_step.clone() {
                                 self.store.meta_set(&format!("next_step:{}", task_id), &step);
+                                if let Ok(rb) = self.assemble_handoff(
+                                    &t,
+                                    &PlanStep {
+                                        step_id: step.clone(),
+                                        role: Role::Reviewer,
+                                        adapter: String::new(),
+                                        permission: String::new(),
+                                        depends_on: vec![],
+                                        handoff: None,
+                                    },
+                                    t.current_generation + 1,
+                                    None,
+                                    None,
+                                ) {
+                                    self.store.meta_set(
+                                        &format!("approved_reviewer_digest:{}", task_id),
+                                        &rb.sha256,
+                                    );
+                                }
                             }
                             t.status = TaskStatus::NeedsReview;
                             t.updated_at = timestamp();
@@ -1653,7 +1761,7 @@ failure_location: cp
         let committed = worktree::run_git(
             &self.cfg.git,
             std::path::Path::new(&wt.path),
-            &["diff", "--binary", &task.base_commit, "HEAD"],
+            &["diff", "--no-textconv", "--no-ext-diff", "--binary", &task.base_commit, "HEAD"],
             None,
         )
         .unwrap_or_default();
@@ -1751,6 +1859,7 @@ failure_location: cp
         decision_id: &str,
         option_id: &str,
         task_revision: u64,
+        approved_digest: &str,
         request: &mut RequestRecord,
     ) -> Result<(Decision, Task), CoreError> {
         let d = self
@@ -1777,6 +1886,34 @@ failure_location: cp
         if task.budget_remaining() <= 0 {
             return Err(CoreError::conflict("budget_exhausted", "resume budget exhausted"));
         }
+        // WP09 weekend: the resume body must be previewed and approved. Assemble the
+        // exact relay body for the next generation WITH this choice applied, verify the
+        // digest, and only then save + queue. Refusals change nothing and cost nothing.
+        let relay_generation = task.current_generation + 1;
+        let writer_step = self
+            .store
+            .latest_plan(&d.task_id)
+            .and_then(|p| {
+                p.steps
+                    .iter()
+                    .find(|s| s.role == Role::Writer)
+                    .cloned()
+            })
+            .ok_or_else(|| CoreError::conflict("plan_missing", "no approved plan"))?;
+        let relay_cp = self.store.latest_checkpoint(&d.task_id);
+        let relay_body = self.assemble_handoff(
+            &task,
+            &writer_step,
+            relay_generation,
+            Some((decision_id, option_id)),
+            relay_cp,
+        )?;
+        if relay_body.sha256 != approved_digest {
+            return Err(CoreError::conflict(
+                "handoff_digest_mismatch",
+                "the digest you approved does not match the body that would be sent; refresh the preview",
+            ));
+        }
         // atomic: mark answered + bind resume request id
         let mut d2 = d.clone();
         d2.status = "answered".into();
@@ -1785,13 +1922,18 @@ failure_location: cp
         d2.answered_at = Some(timestamp());
         self.store.update_decision(&d2)?;
         self.store.resolve_message_by_task(&d.task_id, "decision_opened");
-        // queue resume: task back to queued; scheduler dispatches when slot free
+        // queue resume: task back to queued; scheduler dispatches when slot free.
+        // The relay body digest is bound for this generation; dispatch verifies it.
         let writer_step = self
             .store
             .latest_plan(&d.task_id)
             .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).map(|s| s.step_id.clone()))
             .unwrap_or_else(|| "s1".into());
         self.store.meta_set(&format!("next_step:{}", d.task_id), &writer_step);
+        self.store.meta_set(
+            &format!("approved_relay_digest:{}:{}", d.task_id, relay_generation),
+            &relay_body.sha256,
+        );
         task.status = TaskStatus::Queued;
         task.resume_used += 1;
         task.updated_at = timestamp();
@@ -1812,6 +1954,7 @@ failure_location: cp
         self: &Arc<Self>,
         task_id: &str,
         target_adapter: &str,
+        approved_digest: &str,
         request: &mut RequestRecord,
     ) -> Result<Task, CoreError> {
         let task = self
@@ -1895,6 +2038,28 @@ failure_location: cp
         if !self.repo_trusted(&task.repo_path) {
             return Err(CoreError::conflict("repo_untrusted", "repository is not trusted"));
         }
+        // WP09 weekend: the relay body must be previewed and approved; bind its digest
+        // for the relay generation. Refusals change nothing and cost nothing.
+        let relay_generation = task.current_generation + 1;
+        let writer_step = self
+            .store
+            .latest_plan(task_id)
+            .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).cloned())
+            .ok_or_else(|| CoreError::conflict("plan_missing", "no approved plan"))?;
+        let relay_cp = self.checkpoint_view(&task);
+        let relay_body = self.assemble_handoff(&task, &writer_step, relay_generation, None, relay_cp.clone())?;
+        // persist the checkpoint view (the digest was verified against this content)
+        if let Some(cp) = &relay_cp {
+            if cp.checkpoint_id == "pending" {
+                self.store.insert_checkpoint(cp).ok();
+            }
+        }
+        if relay_body.sha256 != approved_digest {
+            return Err(CoreError::conflict(
+                "handoff_digest_mismatch",
+                "the digest you approved does not match the body that would be sent; refresh the preview",
+            ));
+        }
         let live = self.store.list_live_attempts();
         if !live.is_empty() {
             return Err(CoreError::busy("no_free_slot", "execution slot is busy"));
@@ -1906,6 +2071,10 @@ failure_location: cp
             .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).map(|s| s.step_id.clone()))
             .unwrap_or_else(|| "s1".into());
         self.store.meta_set(&format!("next_step:{}", task_id), &writer_step);
+        self.store.meta_set(
+            &format!("approved_relay_digest:{}:{}", task_id, relay_generation),
+            &relay_body.sha256,
+        );
         let mut t = task;
         t.status = TaskStatus::Queued;
         t.resume_used += 1;

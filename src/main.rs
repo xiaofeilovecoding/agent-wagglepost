@@ -317,16 +317,39 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
             let id = args.first().cloned().unwrap_or_default();
             let opt = args.get(1).cloned().unwrap_or_default();
             // revision read from the card first
-            let rev = http_req(port, &token, &csrf, "GET", &format!("/v1/decisions?status=open"), None, None)
+            let open = http_req(port, &token, &csrf, "GET", "/v1/decisions?status=open", None, None)
                 .ok()
                 .and_then(|v| {
                     v["decisions"]
                         .as_array()?
                         .iter()
                         .find(|d| d["decision_id"].as_str() == Some(id.as_str()))
-                        .and_then(|d| d["revision"].as_u64())
-                })
-                .unwrap_or(0);
+                        .cloned()
+                });
+            let Some(open) = open else {
+                eprintln!("no open decision card found for this id");
+                return 1;
+            };
+            let rev = open["revision"].as_u64().unwrap_or(0);
+            // WP09: preview the exact relay body (with this choice applied) and bind it
+            let prev = match http_req(
+                port,
+                &token,
+                &csrf,
+                "GET",
+                &format!("/v1/tasks/{}/handoff-preview?decision={id}&option={opt}", open["task_id"].as_str().unwrap_or("")),
+                None,
+                None,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("preview failed: {e}");
+                    return 1;
+                }
+            };
+            let digest = prev["approved_digest"].as_str().unwrap_or("").to_string();
+            println!("relay body digest: {digest}");
+            println!("{}", prev["handoff"]["text"].as_str().unwrap_or(""));
             let rid = format!("cli-{}", wagglepost::ids::new_token()[..12].to_string());
             http_req(
                 port,
@@ -334,7 +357,7 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
                 &csrf,
                 "POST",
                 &format!("/v1/decisions/{id}/answer"),
-                Some(&json!({"option_id": opt, "revision": rev})),
+                Some(&json!({"option_id": opt, "revision": rev, "handoff_digest": digest})),
                 Some(&rid),
             )
         }

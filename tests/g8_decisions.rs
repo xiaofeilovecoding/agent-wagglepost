@@ -90,25 +90,18 @@ fn g8_decision_flow_slot_release_and_resume() {
     assert_eq!(err.0, 409, "stale answer rejected");
 
     // correct answer → queued resume
-    let ans = env
-        .req(
-            "POST",
-            &format!("/v1/decisions/{decision_id}/answer"),
-            Some(&json!({"option_id": "opt_keep", "revision": revision})),
-            Some("ans-1"),
-        )
-        .unwrap();
+    let ans = env.answer_card(&task_id, "opt_keep", "ans-1");
     assert_eq!(ans["queued"], json!(true));
 
     // duplicate answer → same receipt, no second launch
-    let ans2 = env
-        .req(
-            "POST",
-            &format!("/v1/decisions/{decision_id}/answer"),
-            Some(&json!({"option_id": "opt_clear", "revision": revision})),
-            Some("ans-2"),
-        )
-        .unwrap();
+    // duplicate answer replays the original receipt (answered check precedes the
+    // digest verification, so a duplicate never triggers a second launch)
+    let ans2 = env.req(
+        "POST",
+        &format!("/v1/decisions/{decision_id}/answer"),
+        Some(&json!({"option_id": "opt_clear", "revision": revision})),
+        Some("ans-2"),
+    ).unwrap();
     assert_eq!(ans2["decision"]["status"], json!("answered"));
     assert_eq!(
         ans2["decision"]["resolution"],
@@ -205,20 +198,14 @@ fn g8_budget_exhaustion_blocks_extra_launch() {
         }),
     );
     // resume after blocked → reroute path consumes resume budget
-    env.req(
-        "POST",
-        &format!("/v1/tasks/{task_id}/reroute"),
-        Some(&json!({"target_adapter": "fake"})),
-        Some("r-1"),
-    )
-    .expect("reroute within budget");
+    env.reroute_queued(&task_id, "fake", "r-1");
     let _ = env.run_until(&task_id, &["interrupted"], Duration::from_secs(90));
     // budget now exhausted (2 launches used) → further relaunch refused with stable reason
     let err = env
         .req(
             "POST",
             &format!("/v1/tasks/{task_id}/reroute"),
-            Some(&json!({"target_adapter": "fake"})),
+            Some(&json!({"target_adapter": "fake", "handoff_digest": "dummy"})),
             Some("r-2"),
         )
         .unwrap_err();
