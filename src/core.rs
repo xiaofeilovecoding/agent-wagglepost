@@ -329,6 +329,8 @@ Sample repository for the offline wagglepost tour.
         if !p.is_dir() {
             return Err(CoreError::bad("repo_missing", "repository path does not exist"));
         }
+        worktree::GitConfig::ensure_no_external_filters(&self.cfg.git, repo_path)
+            .map_err(|e| CoreError::bad("repo_unsafe_git", e))?;
         worktree::resolve_head(&self.cfg.git, repo_path)
             .map_err(|e| CoreError::bad("repo_not_git", format!("not a git repository: {e}")))?;
         self.store
@@ -351,6 +353,10 @@ Sample repository for the offline wagglepost tour.
             input.repo_path.clone()
         };
         let repo_path = normalize_repo(&resolved_repo);
+        // WP02 0700 (fail closed): refuse external filter drivers BEFORE any git
+        // operation that could trigger them (diff/add/checkout all can).
+        worktree::GitConfig::ensure_no_external_filters(&self.cfg.git, &repo_path)
+            .map_err(|e| CoreError::bad("repo_unsafe_git", e))?;
         let base = match &input.base_commit {
             Some(c) if !c.is_empty() => {
                 worktree::resolve_head(&self.cfg.git, &repo_path)
@@ -608,6 +614,9 @@ Sample repository for the offline wagglepost tour.
                 "confirm the repository before approving dispatch",
             ));
         }
+        // WP02 0700: re-verify the config boundary at approval (post-submission changes)
+        worktree::GitConfig::ensure_no_external_filters(&self.cfg.git, &task.repo_path)
+            .map_err(|e| CoreError::conflict("repo_unsafe_git", e))?;
         // WP09: approval binds the EXACT writer first-run body (previewed by the user)
         // and the adapter versions that will run. The digest is assembled server-side
         // so the approved value is always the one dispatch will verify against.
@@ -810,6 +819,10 @@ Sample repository for the offline wagglepost tour.
             ));
         }
 
+        // WP02 0700: re-verify the config boundary at every dispatch (post-approval
+        // config changes are caught here, fail closed before any filter-triggering op)
+        worktree::GitConfig::ensure_no_external_filters(&self.cfg.git, &task.repo_path)
+            .map_err(|e| CoreError::conflict("repo_unsafe_git", e))?;
         // WP09: the launched body must be the approved body (writer first run) and the
         // runtime versions must still match what approval bound.
         if let Some(approved_digest) = plan.approved_handoff_digest.as_deref() {

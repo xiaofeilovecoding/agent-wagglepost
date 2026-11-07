@@ -64,7 +64,7 @@ impl GitConfig {
         for _ in 0..4 {
             let probe = std::process::Command::new(&cfg.git_exe)
                 .args(cfg.isolation_args())
-                .args(["config", "--get-regexp", r"^filter\..+\.(clean|smudge)$"])
+                .args(["config", "--get-regexp", r"^filter\..+\.(process|clean|smudge)$"])
                 .current_dir(Path::new(repo))
                 .env_clear()
                 .envs(git_min_env())
@@ -114,6 +114,54 @@ impl GitConfig {
         }
         overrides
     }
+    /// WP02 0700 (fail closed): refuse repositories whose effective config wires ANY
+    /// external filter driver (process/clean/smudge — native semantics: include,
+    /// includeIf, commondir). Config read failures are also refused: an unparsable
+    /// config cannot be proven safe. Returns the discovered drivers on refusal.
+    pub fn ensure_no_external_filters(cfg: &GitConfig, repo: &str) -> Result<(), String> {
+        let mut last_err: Option<String> = None;
+        for _ in 0..4 {
+            let probe = std::process::Command::new(&cfg.git_exe)
+                .args(cfg.isolation_args())
+                .args(["config", "--get-regexp", r"^filter\..+\.(process|clean|smudge)$"])
+                .current_dir(Path::new(repo))
+                .env_clear()
+                .envs(git_min_env())
+                .envs(cfg.isolation_env())
+                .output();
+            match probe {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout).to_string();
+                    if text.trim().is_empty() {
+                        return Ok(()); // no external filters
+                    }
+                    let drivers: Vec<String> = text
+                        .lines()
+                        .filter_map(|l| l.split(' ').next())
+                        .filter_map(|k| k.strip_prefix("filter."))
+                        .map(|k| k.to_string())
+                        .collect();
+                    return Err(format!(
+                        "repository configures external git filter drivers ({}); remove them or hand off manually",
+                        drivers.join(", ")
+                    ));
+                }
+                Ok(out) if out.status.code() == Some(1) => return Ok(()), // no matches
+                Ok(out) => {
+                    last_err = Some(format!(
+                        "git config read failed (exit {:?}); the repo cannot be proven safe",
+                        out.status.code()
+                    ));
+                }
+                Err(e) => {
+                    last_err = Some(format!("git config read failed: {e}"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Err(last_err.unwrap_or_else(|| "git config read failed".into()))
+    }
+
 
 }
 

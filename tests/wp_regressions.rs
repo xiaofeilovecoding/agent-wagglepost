@@ -147,17 +147,10 @@ fn wp02_configured_filter_neutralized_marker_absent() {
         "recipe": "direct", "allowed_adapters": ["fake"],
     });
     let r = env.req("POST", "/v1/tasks", Some(&body), Some("wp02-2"));
-    assert!(r.is_ok(), "submit proceeds; the filter is neutralized, not refused");
-    let task_id = r.unwrap()["task"]["task_id"].as_str().unwrap().to_string();
-    env.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).expect("trust");
-    env.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None).expect("plan");
-    let hash = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap()["plan"]["summary_hash"].as_str().unwrap().to_string();
-    env.req("POST", &format!("/v1/tasks/{task_id}/plan/approve"), Some(&json!({"summary_hash": hash})), None).expect("approve");
-    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp02-2d")).expect("dispatch");
-    let status = env.run_until(&task_id, &["needs_review", "interrupted"], Duration::from_secs(90));
-    assert_eq!(status, "needs_review");
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(!marker.exists(), "evil filter command must never execute");
+    assert!(r.is_err(), "repo with an external filter must be refused");
+    assert_eq!(r.unwrap_err().1["error"]["code"], json!("repo_unsafe_git"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "evil filter command must never execute (refused at submit)");
 }
 #[test]
 fn wp03_out_of_scope_change_blocks_candidate() {
@@ -473,88 +466,82 @@ fn wp08_multibyte_truncation_no_panic() {
 // ---------- 0700: WP02 reopened — include.path filter neutralized via git semantics ----------
 
 #[test]
-fn wp02b_included_filter_neutralized_and_reverified_at_dispatch() {
+fn wp02b_included_filter_repo_refused_fail_closed() {
     let env = TestEnv::new();
     let marker = env.managed_root.parent().unwrap().join("include-filter-marker");
     let _ = std::fs::remove_file(&marker);
     let include_cfg = env.user_repo.join("external-filter.conf");
-    let exe = env!("CARGO_BIN_EXE_wagglepost").replace('\\', "/");
-    let clean_cmd = format!(
+    let exe = env!("CARGO_BIN_EXE_wagglepost").replace("\\", "/");
+    // PROCESS driver (the 08:20 counterexample) via include.path
+    let process_cmd = format!(
         "{exe} --verify WAGGLEPOST_NO_SUCH_REF_0700; echo executed > \"{}\"; cat",
-        marker.to_string_lossy().replace('\\', "/")
+        marker.to_string_lossy().replace("\\", "/")
     );
     common::git(
         &env.user_repo,
-        &["config", "-f", include_cfg.to_string_lossy().as_ref(), "filter.waggleproof.clean", &clean_cmd],
+        &["config", "-f", include_cfg.to_string_lossy().as_ref(), "filter.waggleproof.process", &process_cmd],
     );
     common::git(
         &env.user_repo,
-        &["config", "-f", include_cfg.to_string_lossy().as_ref(), "filter.waggleproof.smudge", &clean_cmd],
+        &["config", "-f", include_cfg.to_string_lossy().as_ref(), "filter.waggleproof.clean", &process_cmd],
     );
     common::git(&env.user_repo, &["config", "--local", "include.path", include_cfg.to_string_lossy().as_ref()]);
-    println!("[m1] after include.path: {}", marker.exists());
-    std::fs::write(env.user_repo.join(".gitattributes"), "*.txt filter=waggleproof\n").unwrap();
-    println!("[m2] after attrs write: {}", marker.exists());
-    // the test's own staging also runs through isolated git (hostile filter active)
-    common::git(&env.user_repo, &["-c", "filter.waggleproof.clean=exit 1", "-c", "filter.waggleproof.smudge=exit 1", "add", "-A"]);
-    common::git(&env.user_repo, &["-c", "filter.waggleproof.clean=exit 1", "-c", "filter.waggleproof.smudge=exit 1", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "attrs"]);
-    println!("[m3] after isolated staging: {}", marker.exists());
-    // the plain-git setup add ran the filter once (no isolation in the test harness);
-    // from here on the PRODUCT runs — it must never execute the filter again
+    std::fs::write(env.user_repo.join(".gitattributes"), "*.txt filter=waggleproof
+").unwrap();
+    // NOTE: no staging here — the fail-closed refusal fires BEFORE the dirty check,
+    // so no git operation that could trigger the process filter is ever reached.
     let _ = std::fs::remove_file(&marker);
 
-    let (task_id, _) = env.ready_task(
-        "direct",
-        Some("fake"),
-        Some(json!({
-            "behaviors": ["write_files"],
-            "files": {"lib.txt": "baseline content\nincluded filter probe (simulated)\n"},
-            "result": {"status": "done", "summary": "done (simulated)"}
-        })),
-    );
-    println!("[marker-check] before dispatch: {}", marker.exists());
-    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("wp02b-1")).expect("dispatch");
-    println!("[marker-check] after dispatch call: {}", marker.exists());
-    let status = env.run_until(&task_id, &["needs_review", "interrupted"], Duration::from_secs(90));
-    assert_eq!(status, "needs_review");
-    println!("[marker-check] after run: {}", marker.exists());
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        !marker.exists(),
-        "filter command must never execute (include.path config included)"
-    );
+    let body = json!({
+        "goal": "g", "repo_path": env.user_repo.to_string_lossy(),
+        "recipe": "direct", "allowed_adapters": ["fake"],
+    });
+    let r = env.req("POST", "/v1/tasks", Some(&body), Some("wp02b-1"));
+    assert!(r.is_err(), "include.path filter (process) must be refused at submit");
+    assert_eq!(r.unwrap_err().1["error"]["code"], json!("repo_unsafe_git"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "process filter must never execute");
 
-    // filter added AFTER approval still neutralized at dispatch
+    // post-approval config change: a clean repo approved, then a filter appears → dispatch refuses
+    // clear the refused repo's include first so t2's clean repo can be planned
+    common::git(&env.user_repo, &["config", "--local", "--unset-all", "include.path"]);
+    // the uncommitted .gitattributes + late config make the repo dirty → explicit base
+    let head = common::git(&env.user_repo, &["rev-parse", "HEAD"]);
+    let (t2, head_hash) = (String::new(), head.trim().to_string());
+    let mut body2 = json!({
+        "goal": "append one demo line to lib.txt (offline simulated)",
+        "repo_path": env.user_repo.to_string_lossy(),
+        "recipe": "direct",
+        "allowed_adapters": ["fake"],
+        "base_commit": head_hash,
+    });
+    let resp2 = env.req("POST", "/v1/tasks", Some(&body2), Some("wp02b-t2")).expect("submit t2");
+    let t2 = resp2["task"]["task_id"].as_str().unwrap().to_string();
+    env.req("POST", &format!("/v1/tasks/{t2}/trust"), Some(&json!({})), None).expect("trust");
+    let plan2 = env.req("POST", &format!("/v1/tasks/{t2}/plan"), Some(&json!({})), None).expect("plan");
+    let hash2 = plan2["plan"]["summary_hash"].as_str().unwrap().to_string();
+    env.req("POST", &format!("/v1/tasks/{t2}/plan/approve"), Some(&json!({"summary_hash": hash2})), None).expect("approve");
+    let _ = body2;
+    let _ = (&t2, &head_hash);
+    // the late filter appears AFTER approval → dispatch refuses (fail closed)
     let marker2 = env.managed_root.parent().unwrap().join("late-filter-marker");
     let _ = std::fs::remove_file(&marker2);
-    common::git(&env.user_repo, &["config", "--local", "--unset", "include.path"]);
-    let include2 = env.user_repo.join("late-filter.conf");
-    let clean_cmd2 = format!(
+    let late_inc = env.user_repo.join("late-filter.conf");
+    let late_cmd = format!(
         "echo executed > \"{}\"; cat",
-        marker2.to_string_lossy().replace('\\', "/")
+        marker2.to_string_lossy().replace("\\", "/")
     );
-    common::git(&env.user_repo, &["config", "-f", include2.to_string_lossy().as_ref(), "filter.late.clean", &clean_cmd2]);
-    common::git(&env.user_repo, &["config", "--local", "include.path", include2.to_string_lossy().as_ref()]);
-    // stage the new config file through isolated git (untracked files make the repo dirty)
-    common::git(&env.user_repo, &["-c", "filter.late.clean=exit 1", "-c", "filter.late.smudge=exit 1", "add", "-A"]);
-    common::git(&env.user_repo, &["-c", "filter.late.clean=exit 1", "-c", "filter.late.smudge=exit 1", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "late attrs"]);
-    let (t2, _) = env.ready_task(
-        "direct",
-        Some("fake"),
-        Some(json!({
-            "behaviors": ["write_files"],
-            "files": {"lib.txt": "baseline content\nlate filter probe (simulated)\n"},
-            "result": {"status": "done", "summary": "done (simulated)"}
-        })),
-    );
-    env.req("POST", &format!("/v1/tasks/{t2}/plan/approve"), Some(&json!({"summary_hash": env.plan_hash(&t2)})), None).expect("approve");
-    // mutate config AFTER approval
-    std::fs::write(env.user_repo.join(".gitattributes"), "*.txt filter=late\n").unwrap();
-    env.req("POST", &format!("/v1/tasks/{t2}/dispatch"), Some(&json!({})), Some("wp02b-2")).expect("dispatch");
-    let status2 = env.run_until(&t2, &["needs_review", "interrupted"], Duration::from_secs(90));
-    assert_eq!(status2, "needs_review");
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(!marker2.exists(), "post-approval filter additions must not execute at dispatch");
+    common::git(&env.user_repo, &["config", "-f", late_inc.to_string_lossy().as_ref(), "filter.late.process", &late_cmd]);
+    common::git(&env.user_repo, &["config", "--local", "include.path", late_inc.to_string_lossy().as_ref()]);
+    let err = env.req(
+        "POST",
+        &format!("/v1/tasks/{t2}/dispatch"),
+        Some(&json!({})),
+        Some("wp02b-2"),
+    ).unwrap_err();
+    assert_eq!(err.1["error"]["code"], json!("repo_unsafe_git"), "post-approval filter additions are refused at dispatch");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker2.exists(), "late filter must never execute");
 }
 
 // ---------- 0700: WP04 reopened — export failure must not fake acceptance ----------
