@@ -3,7 +3,232 @@ mod common;
 
 use common::TestEnv;
 use serde_json::json;
-use wagglepost::model::{Attempt, AttemptStatus, Role, TaskStatus};
+use std::io::{BufRead, BufReader};
+use std::time::Duration;
+use wagglepost::model::{Attempt, AttemptStatus, Decision, DecisionOption, Role, TaskStatus};
+
+#[test]
+fn wp19_sse_mixed_window_resyncs_without_leaking_b() {
+    let env = TestEnv::new_with_cli_scope();
+    let (a_id, _) = env.ready_task("direct", Some("fake"), None);
+    let outside = env.managed_root.parent().unwrap().join("sse-b-repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("x.txt"), "b\n").unwrap();
+    common::git(&outside, &["init", "-q", "-b", "main"]);
+    common::git(&outside, &["add", "-A"]);
+    common::git(
+        &outside,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
+    );
+    let b_body = json!({
+        "goal": "SSE B task",
+        "repo_path": outside.to_string_lossy(),
+        "allowed_adapters": ["fake"],
+    });
+    let b_task = env
+        .raw(
+            "POST",
+            "/v1/tasks",
+            Some(&b_body),
+            &[
+                ("Cookie", &format!("wp_session={}", env.browser_token)),
+                ("Origin", &env.base()),
+                ("X-CSRF-Token", &env.csrf),
+            ],
+        )
+        .expect("browser creates B task");
+    let b_id = b_task["task"]["task_id"].as_str().unwrap().to_string();
+
+    let before = env.core.bus.current_seq();
+    env.core.bus.emit(Some(&a_id), None, 0, "synthetic", json!({"n": "a1"}));
+    for n in 0..500 {
+        env.core.bus.emit(Some(&b_id), None, 0, "synthetic", json!({"n": n}));
+    }
+    env.core.bus.emit(Some(&a_id), None, 0, "synthetic", json!({"n": "a2"}));
+
+    let resp = ureq::get(&format!("{}/v1/events", env.base()))
+        .timeout(Duration::from_secs(5))
+        .set("Authorization", "Bearer test-token")
+        .set("Last-Event-ID", &before.to_string())
+        .call()
+        .expect("SSE call");
+    let mut reader = BufReader::new(resp.into_reader());
+    let mut lines = Vec::new();
+    // resync (event+data+blank) + the oldest authorized A (event+data+blank).
+    // The second A is the 502nd raw event outside the 501-row replay read; the
+    // resync tells the client to refetch the snapshot instead of silently losing it.
+    for _ in 0..6 {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("SSE line");
+        lines.push(line);
+    }
+    let visible = lines.join("");
+    assert!(visible.contains("event: resync"), "raw 502-event window must resync: {visible}");
+    assert!(visible.contains(&a_id), "authorized A events survive: {visible}");
+    assert!(!visible.contains(&b_id), "B events must not leak: {visible}");
+}
+
+fn running_attempt(task_id: &str, attempt_id: &str, revision: u64) -> Attempt {
+    Attempt {
+        attempt_id: attempt_id.into(),
+        task_id: task_id.into(),
+        task_revision: revision,
+        step_id: "s1".into(),
+        adapter: "fake".into(),
+        adapter_version: "0.1.0".into(),
+        role: Role::Writer,
+        worktree_id: None,
+        generation: 1,
+        native_id: None,
+        request_id: None,
+        status: AttemptStatus::Running,
+        launch_no: 1,
+        exit_code: None,
+        started_at: Some(wagglepost::store::timestamp()),
+        ended_at: None,
+        simulated: true,
+        handoff_digest: None,
+        pid: None,
+    }
+}
+
+fn open_decision(task_id: &str, decision_id: &str, attempt_id: &str, revision: u64) -> Decision {
+    Decision {
+        decision_id: decision_id.into(),
+        task_id: task_id.into(),
+        revision,
+        attempt_id: attempt_id.into(),
+        checkpoint_id: None,
+        question: "continue? (synthetic)".into(),
+        options: vec![DecisionOption {
+            id: "continue".into(),
+            label_zh: "继续".into(),
+            label_en: "Continue".into(),
+            effect_zh: "继续".into(),
+            effect_en: "Continue".into(),
+        }],
+        status: "open".into(),
+        dedupe_key: format!("decision:{task_id}:{decision_id}"),
+        merge_count: 1,
+        resolution: None,
+        resume_request_id: None,
+        created_at: wagglepost::store::timestamp(),
+        answered_at: None,
+    }
+}
+
+#[test]
+fn wp18_cancel_and_answer_receipts_bind_task_scope() {
+    let env = TestEnv::new_with_cli_scope();
+    let (a_id, _) = env.ready_task("direct", Some("fake"), None);
+    let outside = env.managed_root.parent().unwrap().join("receipt-b-repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    common::git(&outside, &["init", "-q", "-b", "main"]);
+    std::fs::write(outside.join("x.txt"), "b\n").unwrap();
+    common::git(&outside, &["add", "-A"]);
+    common::git(
+        &outside,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
+    );
+    let b_task = env
+        .raw(
+            "POST",
+            "/v1/tasks",
+            Some(&json!({
+                "goal": "receipt B task",
+                "repo_path": outside.to_string_lossy(),
+                "allowed_adapters": ["fake"],
+            })),
+            &[
+                ("Cookie", &format!("wp_session={}", env.browser_token)),
+                ("Origin", &env.base()),
+                ("X-CSRF-Token", &env.csrf),
+            ],
+        )
+        .expect("browser creates B task");
+    let b_id = b_task["task"]["task_id"].as_str().unwrap().to_string();
+    let b_rev = env.core.store.get_task(&b_id).unwrap().revision;
+    let a_rev = env.core.store.get_task(&a_id).unwrap().revision;
+
+    env.core
+        .store
+        .insert_attempt(&running_attempt(&a_id, "a-receipt-a", a_rev))
+        .unwrap();
+    env.core
+        .store
+        .insert_attempt(&running_attempt(&b_id, "a-receipt-b", b_rev))
+        .unwrap();
+    env.core
+        .store
+        .insert_decision(&open_decision(&a_id, "d-receipt-a", "a-receipt-a", a_rev))
+        .unwrap();
+    env.core
+        .store
+        .insert_decision(&open_decision(&b_id, "d-receipt-b", "a-receipt-b", b_rev))
+        .unwrap();
+
+    let cookie = format!("wp_session={}", env.browser_token);
+    let origin = env.base();
+    let csrf = env.csrf.clone();
+    let browser_headers = [
+        ("Cookie", cookie.as_str()),
+        ("Origin", origin.as_str()),
+        ("X-CSRF-Token", csrf.as_str()),
+    ];
+    let cancel_headers = [
+        browser_headers[0],
+        browser_headers[1],
+        browser_headers[2],
+        ("Idempotency-Key", "browser-cancel-b"),
+    ];
+    let answer_headers = [
+        browser_headers[0],
+        browser_headers[1],
+        browser_headers[2],
+        ("Idempotency-Key", "browser-answer-b"),
+    ];
+    // Browser cancels/answers the out-of-scope B task; the CLI must not read the
+    // resulting request receipts by knowing their idempotency keys.
+    env.raw(
+        "POST",
+        "/v1/attempts/a-receipt-b/cancel",
+        Some(&json!({})),
+        &cancel_headers,
+    )
+    .expect("browser cancels B");
+    env.raw(
+        "POST",
+        "/v1/decisions/d-receipt-b/answer",
+        Some(&json!({"option_id": "continue", "revision": b_rev})),
+        &answer_headers,
+    )
+    .ok();
+    for key in ["browser-cancel-b", "browser-answer-b"] {
+        let err = env.req("GET", &format!("/v1/requests/{key}"), None, None).unwrap_err();
+        assert_eq!(err.0, 403, "{key} must not leak B attempt: {err:?}");
+        assert_eq!(err.1["error"]["code"], json!("repo_not_authorized"));
+    }
+
+    // Same operations on the authorized A repository remain replayable to the CLI.
+    env.req(
+        "POST",
+        "/v1/attempts/a-receipt-a/cancel",
+        Some(&json!({})),
+        Some("cli-cancel-a"),
+    )
+    .expect("CLI cancels A");
+    let rec = env.req("GET", "/v1/requests/cli-cancel-a", None, None).expect("CLI reads A cancel");
+    assert_eq!(rec["request"]["task_id"], json!(a_id));
+    env.req(
+        "POST",
+        "/v1/decisions/d-receipt-a/answer",
+        Some(&json!({"option_id": "continue", "revision": a_rev})),
+        Some("cli-answer-a"),
+    )
+    .ok();
+    let rec = env.req("GET", "/v1/requests/cli-answer-a", None, None).expect("CLI reads A answer");
+    assert_eq!(rec["request"]["task_id"], json!(a_id));
+}
 
 #[test]
 fn wp12_log_retention_removes_only_expired_logs() {

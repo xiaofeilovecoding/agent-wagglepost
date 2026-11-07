@@ -694,8 +694,9 @@ async fn cancel_attempt(
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
-    if let Some(a) = state.core.store.get_attempt(&id) {
-        if !task_repo_allowed(&state, bearer, &a.task_id) {
+    let task_id = state.core.store.get_attempt(&id).map(|a| a.task_id);
+    if let Some(tid) = task_id.as_deref() {
+        if !task_repo_allowed(&state, bearer, tid) {
             return repo_forbidden();
         }
     }
@@ -706,7 +707,7 @@ async fn cancel_attempt(
         .or_else(|| body.get("request_id").and_then(|r| r.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| format!("auto-cancel-{}", new_token()));
     let digest = canonical_digest(&json!({"op": "cancel", "attempt": id}));
-    let rec = match state.core.begin_request(&request_id, "cancel", None, digest) {
+    let rec = match state.core.begin_request(&request_id, "cancel", task_id.as_deref(), digest) {
         Ok(r) => r,
         Err(e) => return core_error_response(&e),
     };
@@ -753,8 +754,9 @@ async fn answer_decision(
     if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
-    if let Some(d) = state.core.store.get_decision(&id) {
-        if !task_repo_allowed(&state, bearer, &d.task_id) {
+    let decision_task_id = state.core.store.get_decision(&id).map(|d| d.task_id);
+    if let Some(tid) = decision_task_id.as_deref() {
+        if !task_repo_allowed(&state, bearer, tid) {
             return repo_forbidden();
         }
     }
@@ -774,7 +776,10 @@ async fn answer_decision(
         return error_response(StatusCode::BAD_REQUEST, "request_id_required", "answer needs an Idempotency-Key");
     }
     let digest = canonical_digest(&json!({"op": "answer", "decision": id, "option": option_id, "revision": revision}));
-    let mut rec = match state.core.begin_request(&request_id, "answer", None, digest) {
+    let mut rec = match state
+        .core
+        .begin_request(&request_id, "answer", decision_task_id.as_deref(), digest)
+    {
         Ok(r) => r,
         Err(e) => return core_error_response(&e),
     };
@@ -1066,14 +1071,33 @@ async fn get_request(State(state): State<SharedState>, Path(id): Path<String>, h
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
         return r;
     }
-    if let Some(rec) = state.core.store.get_request(&id) {
-        if let Some(tid) = rec.task_id.as_deref() {
-            if !task_repo_allowed(&state, bearer, tid) {
-                return repo_forbidden();
-            }
+    let rec = state.core.store.get_request(&id);
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        let allowed = match rec.as_ref().and_then(|r| r.task_id.as_deref()) {
+            Some(tid) => task_repo_allowed(&state, true, tid),
+            None => rec
+                .as_ref()
+                .and_then(|r| r.attempt_id.as_deref())
+                .and_then(|aid| state.core.store.get_attempt(aid))
+                .map(|a| task_repo_allowed(&state, true, &a.task_id))
+                .unwrap_or(false),
+        };
+        if !allowed {
+            // A bound request outside the scope is an authorization refusal; an
+            // old record with no provable task/attempt association is hidden as
+            // not found rather than exposed to a restricted CLI.
+            let has_association = rec
+                .as_ref()
+                .map(|r| r.task_id.is_some() || r.attempt_id.is_some())
+                .unwrap_or(false);
+            return if has_association {
+                repo_forbidden()
+            } else {
+                error_response(StatusCode::NOT_FOUND, "not_found", "request record is not in this CLI scope")
+            };
         }
     }
-    match state.core.store.get_request(&id) {
+    match rec {
         Some(rec) => {
             // reconciliation semantics: completed → replay result; processing after
             // restart → unknown state honestly; never suggest auto-resend
@@ -1114,9 +1138,10 @@ async fn sse_events(
     // outside the 500-event window gets an explicit resync signal so it refetches
     // the authoritative snapshot instead of silently rendering a gap.
     let mut missed = state.core.store.list_events_after(last_id, 501);
-    if bearer && !state.cli_allowed_repos.is_empty() {
-        missed.retain(|e| event_visible(&state, true, e.task_id.as_deref()));
-    }
+    // WP19: decide completeness from the RAW window before authorization
+    // filtering. A/B/A mixtures must resync even when only a few visible events
+    // remain; otherwise the last authorized event after 500 foreign events is
+    // silently lost.
     let mut gap = missed.len() > 500;
     if last_id > 0 && missed.is_empty() && state.core.bus.current_seq() < last_id {
         gap = true;
@@ -1125,6 +1150,9 @@ async fn sse_events(
         if last_id > 0 && first.seq > last_id + 1 {
             gap = true;
         }
+    }
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        missed.retain(|e| event_visible(&state, true, e.task_id.as_deref()));
     }
     if missed.len() > 500 {
         missed = missed.split_off(missed.len() - 500);
