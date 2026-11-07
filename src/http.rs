@@ -230,6 +230,16 @@ fn repo_forbidden() -> Response {
     )
 }
 
+fn event_visible(state: &SharedState, bearer: bool, task_id: Option<&str>) -> bool {
+    if !bearer || state.cli_allowed_repos.is_empty() {
+        return true;
+    }
+    match task_id {
+        Some(t) => task_repo_allowed(state, true, t),
+        None => true,
+    }
+}
+
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
     let body = json!({"error": {"code": code, "message": message}});
     (status, Json(body)).into_response()
@@ -1104,6 +1114,9 @@ async fn sse_events(
     // outside the 500-event window gets an explicit resync signal so it refetches
     // the authoritative snapshot instead of silently rendering a gap.
     let mut missed = state.core.store.list_events_after(last_id, 501);
+    if bearer && !state.cli_allowed_repos.is_empty() {
+        missed.retain(|e| event_visible(&state, true, e.task_id.as_deref()));
+    }
     let mut gap = missed.len() > 500;
     if last_id > 0 && missed.is_empty() && state.core.bus.current_seq() < last_id {
         gap = true;
@@ -1116,40 +1129,47 @@ async fn sse_events(
     if missed.len() > 500 {
         missed = missed.split_off(missed.len() - 500);
     }
-    let live = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let data = serde_json::json!({
-                        "seq": ev.seq,
-                        "task_id": ev.task_id,
-                        "attempt_id": ev.attempt_id,
-                        "generation": ev.generation,
-                        "kind": ev.kind,
-                        "payload": ev.payload,
-                        "ts": ev.ts,
-                    });
-                    return Some((
-                        Ok::<_, Infallible>(SseEvent::default()
-                            .event(ev.kind.clone())
-                            .id(ev.seq.to_string())
-                            .data(data.to_string())),
-                        rx,
-                    ));
+    let state_for_live = state.clone();
+    let live = futures_util::stream::unfold(rx, move |mut rx| {
+        let state_for_live = state_for_live.clone();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if !event_visible(&state_for_live, bearer, ev.task_id.as_deref()) {
+                            continue;
+                        }
+                        let data = serde_json::json!({
+                            "seq": ev.seq,
+                            "task_id": ev.task_id,
+                            "attempt_id": ev.attempt_id,
+                            "generation": ev.generation,
+                            "kind": ev.kind,
+                            "payload": ev.payload,
+                            "ts": ev.ts,
+                        });
+                        return Some((
+                            Ok::<_, Infallible>(SseEvent::default()
+                                .event(ev.kind.clone())
+                                .id(ev.seq.to_string())
+                                .data(data.to_string())),
+                            rx,
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        let data = serde_json::json!({
+                            "kind": "resync",
+                            "payload": {"reason": "lagged", "skipped": skipped},
+                        });
+                        return Some((
+                            Ok::<_, Infallible>(
+                                SseEvent::default().event("resync").data(data.to_string()),
+                            ),
+                            rx,
+                        ));
+                    }
+                    Err(_) => return None,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    let data = serde_json::json!({
-                        "kind": "resync",
-                        "payload": {"reason": "lagged", "skipped": skipped},
-                    });
-                    return Some((
-                        Ok::<_, Infallible>(
-                            SseEvent::default().event("resync").data(data.to_string()),
-                        ),
-                        rx,
-                    ));
-                }
-                Err(_) => return None,
             }
         }
     });
