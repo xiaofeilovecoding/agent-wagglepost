@@ -5,7 +5,7 @@ use common::TestEnv;
 use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
-use wagglepost::model::{Attempt, AttemptStatus, Decision, DecisionOption, Role, TaskStatus};
+use wagglepost::model::{Attempt, AttemptStatus, Decision, DecisionOption, RequestRecord, Role, TaskStatus};
 
 #[test]
 fn wp19_sse_mixed_window_resyncs_without_leaking_b() {
@@ -208,6 +208,38 @@ fn wp18_cancel_and_answer_receipts_bind_task_scope() {
         assert_eq!(err.0, 403, "{key} must not leak B attempt: {err:?}");
         assert_eq!(err.1["error"]["code"], json!("repo_not_authorized"));
     }
+    // Legacy/old records: task_id may be absent. A reliable attempt association
+    // may still close the cross-repo record; no association at all stays hidden.
+    let legacy = RequestRecord {
+        request_id: "legacy-cancel-b".into(),
+        kind: "cancel".into(),
+        digest: "legacy".into(),
+        task_id: None,
+        attempt_id: Some("a-receipt-b".into()),
+        status: "completed".into(),
+        replayed: false,
+        result: json!({"cancelling": true}),
+        created_at: wagglepost::store::timestamp(),
+        updated_at: wagglepost::store::timestamp(),
+    };
+    env.core.store.insert_request(&legacy).unwrap();
+    let err = env.req("GET", "/v1/requests/legacy-cancel-b", None, None).unwrap_err();
+    assert_eq!(err.0, 403, "legacy record bound through attempt must remain closed");
+    let orphan = RequestRecord {
+        request_id: "orphan-record".into(),
+        kind: "cancel".into(),
+        digest: "orphan".into(),
+        task_id: None,
+        attempt_id: None,
+        status: "completed".into(),
+        replayed: false,
+        result: json!({}),
+        created_at: wagglepost::store::timestamp(),
+        updated_at: wagglepost::store::timestamp(),
+    };
+    env.core.store.insert_request(&orphan).unwrap();
+    let err = env.req("GET", "/v1/requests/orphan-record", None, None).unwrap_err();
+    assert_eq!(err.0, 404, "unassociated legacy record is not exposed to restricted CLI");
 
     // Same operations on the authorized A repository remain replayable to the CLI.
     env.req(
