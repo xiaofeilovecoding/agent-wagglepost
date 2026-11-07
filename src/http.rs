@@ -59,6 +59,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Router fallback (晚间复审 WP13): unknown `/v1/*` API paths get a stable JSON
+/// 404 — never the SPA page, so a POST to a removed endpoint cannot look like
+/// success. Everything else falls through to the embedded UI (SPA navigation).
+pub async fn api_or_static_fallback(uri: axum::http::Uri) -> Response {
+    if uri.path().starts_with("/v1/") {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "no such API route");
+    }
+    crate::ui::static_handler(uri).await
+}
+
 // ---------------- auth ----------------
 
 fn host_ok(host: &str, port: u16) -> bool {

@@ -82,7 +82,11 @@ impl TestEnv {
                     csrf_token: "test-csrf".into(),
                     port,
                 });
-                let _ = axum::serve(listener, router(state)).await;
+                // mirror production exactly: same fallback (晚间复审 WP13 — the
+                // old test env served a bare 404 where production returned the
+                // SPA page with 200, hiding the defect)
+                let app = router(state).fallback(wagglepost::http::api_or_static_fallback);
+                let _ = axum::serve(listener, app).await;
             });
         });
         let SC = format!("code-{}", &new_token()[..8]);

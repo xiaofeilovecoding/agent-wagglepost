@@ -1,20 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[path = "src/asset_guard.rs"]
 mod asset_guard;
 
-// Build-time guard (WP12): the embedded web bundle must never be stale or
-// tampered. Verifies (1) no build input newer than dist (stale), and (2) every
-// dist asset content digest matches ASSETS.sha (manifest).
-fn input_dirs() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("web/src"),
-        PathBuf::from("web/build.mjs"),
-        PathBuf::from("web/package.json"),
-        PathBuf::from("web/package-lock.json"),
-    ]
-}
-
+// Build-time guard (WP12): the embedded web bundle must be exactly what the
+// current build inputs produce. `verify_manifest` checks the content digests
+// of the recorded build inputs (sources, build.mjs, lockfiles) AND of the
+// produced artifacts, plus set completeness — an empty, partial, duplicate or
+// unlisted entry fails the build. Merely touching mtimes can no longer pass a
+// stale bundle. No web/dist yet (before the first `npm run build`) keeps the
+// explicit dev placeholder path below.
 fn main() {
     println!("cargo:rerun-if-changed=web/dist");
     println!("cargo:rerun-if-changed=web/src");
@@ -26,14 +21,7 @@ fn main() {
         println!("cargo:warning=web/dist missing — the embedded UI will be a placeholder; run `npm run build` in web/ first");
         return;
     }
-    // 1. staleness: any build input newer than the newest dist output fails
-    let inputs: Vec<PathBuf> = input_dirs().into_iter().filter(|p| p.exists()).collect();
-    if let Err(e) = asset_guard::check_inputs_fresh(&inputs, dist) {
-        panic!("web assets are STALE: {e}");
-    }
-    // 2. content: every asset digest must match ASSETS.sha (touching mtimes cannot
-    //    mask a content change; a replaced app.js fails here)
-    if let Err(e) = asset_guard::verify_manifest(dist) {
+    if let Err(e) = asset_guard::verify_manifest(dist, Path::new("web")) {
         panic!("web assets MISMATCH: {e}");
     }
 }

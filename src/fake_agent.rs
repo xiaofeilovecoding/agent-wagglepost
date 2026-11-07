@@ -79,11 +79,21 @@ pub fn run(args: &[String]) -> i32 {
                     return 3;
                 }
                 let full = std::path::Path::new(path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                // 晚间复审 WP13: validate BEFORE creating anything — create_dir_all
+                // used to run first and followed a junction, leaving directories
+                // behind in the link target even though the write itself was refused.
+                if let Err(reason) = validate_no_reparse_ancestors(full) {
+                    out(json!({"fake": "1", "type": "error", "message": format!("write rejected: {reason}"), "simulated": true}));
+                    eprintln!("fake-agent: write rejected ({reason}): {path}");
+                    return 3;
                 }
-                // re-check after mkdir: an ancestor may have been swapped
-                if let Err(reason) = validate_no_symlink_ancestors(full) {
+                if let Err(reason) = create_dirs_validated(full) {
+                    out(json!({"fake": "1", "type": "error", "message": format!("write rejected: {reason}"), "simulated": true}));
+                    eprintln!("fake-agent: write rejected ({reason}): {path}");
+                    return 3;
+                }
+                // re-check after creation: an ancestor may have been swapped
+                if let Err(reason) = validate_no_reparse_ancestors(full) {
                     out(json!({"fake": "1", "type": "error", "message": format!("write rejected: {reason}"), "simulated": true}));
                     eprintln!("fake-agent: write rejected ({reason}): {path}");
                     return 3;
@@ -152,15 +162,56 @@ fn validate_workspace_path(rel: &std::path::Path) -> Result<(), String> {
 
 /// Reject symlink/reparse-point escapes: any existing ancestor of the target
 /// (below the cwd) that is a link means the write could leave the workspace.
-fn validate_no_symlink_ancestors(target: &std::path::Path) -> Result<(), String> {
+/// Windows junctions / mount points are reparse points that `is_symlink()` may
+/// not report, so the FILE_ATTRIBUTE_REPARSE_POINT bit is checked explicitly.
+fn validate_no_reparse_ancestors(target: &std::path::Path) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    // check each component for symlinks
     let mut cur = cwd.clone();
     for comp in target.components() {
         cur = cur.join(comp);
         if let Ok(md) = std::fs::symlink_metadata(&cur) {
-            if md.file_type().is_symlink() {
-                return Err(format!("symlink escape at {}", cur.display()));
+            if is_link(&md) {
+                return Err(format!("reparse-point escape at {}", cur.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_link(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    md.file_type().is_symlink() || (md.file_attributes() & 0x400) != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+}
+
+#[cfg(not(windows))]
+fn is_link(md: &std::fs::Metadata) -> bool {
+    md.file_type().is_symlink()
+}
+
+/// Create the missing parent directories of `target` ONE level at a time,
+/// re-validating each level after it appears — never `create_dir_all`, which
+/// follows junctions/symlinks and would build inside the link target. Only
+/// directories at already-validated, link-free levels are ever created, so a
+/// rejection leaves no external directory behind.
+fn create_dirs_validated(target: &std::path::Path) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let comps: Vec<_> = target.components().collect();
+    let dir_count = comps.len().saturating_sub(1); // everything except the file name
+    let mut cur = cwd.clone();
+    for comp in comps.iter().take(dir_count) {
+        cur = cur.join(comp);
+        match std::fs::create_dir(&cur) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("mkdir {}: {e}", cur.display())),
+        }
+        if let Ok(md) = std::fs::symlink_metadata(&cur) {
+            if is_link(&md) {
+                return Err(format!("reparse-point escape at {}", cur.display()));
+            }
+            if !md.is_dir() {
+                return Err(format!("not a directory: {}", cur.display()));
             }
         }
     }

@@ -48,7 +48,7 @@ fn print_usage() {
            wagglepost status <task_id> --json                    task snapshot\n\
            wagglepost inbox [--after SEQ] --json                 inbox messages\n\
            wagglepost request show <request_id> --json           request reconciliation\n\
-           wagglepost answer <decision_id> <option_id>           preview the relay body (nothing sent)\n\
+           wagglepost answer <decision_id> <option_id> [--json]  preview the relay body (nothing sent)\n\
            wagglepost answer <decision_id> <option_id> --digest <d>\n\
                                                                  confirm with the reviewed digest\n\
            wagglepost why <task_id> --json                       route reasons + events\n\
@@ -134,7 +134,7 @@ fn cmd_serve(args: Vec<String>) -> i32 {
             csrf_token: csrf,
             port,
         });
-        let ui_router = router(state).fallback(wagglepost::ui::static_handler);
+        let ui_router = router(state).fallback(wagglepost::http::api_or_static_fallback);
         eprintln!("蜂递 WagglePost serving on http://127.0.0.1:{port}");
         eprintln!("startup code: {startup_code}");
         eprintln!("managed root: {}", managed_root.display());
@@ -366,6 +366,19 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
                     Some(&json!({"option_id": opt, "revision": rev, "handoff_digest": user_digest})),
                     Some(&rid),
                 )
+            } else if args.iter().any(|a| a == "--json") {
+                // 晚间复审 WP09: machine mode prints ONE parseable object (the
+                // prose preview used to precede it, breaking JSON parsers);
+                // nothing is submitted here either.
+                Ok(json!({
+                    "previewed": true,
+                    "decision_id": id,
+                    "option_id": opt,
+                    "revision": rev,
+                    "task_id": task_id,
+                    "digest": digest,
+                    "handoff": {"text": body_text, "bytes": body_bytes},
+                }))
             } else {
                 println!("=== relay body ({} bytes) ===", body_bytes);
                 println!("{}", body_text);
