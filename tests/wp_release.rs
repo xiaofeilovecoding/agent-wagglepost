@@ -8,6 +8,24 @@ use std::time::Duration;
 use wagglepost::model::{Attempt, AttemptStatus, Decision, DecisionOption, RequestRecord, Role, TaskStatus};
 
 #[test]
+fn wp20_tick_accepts_json_and_empty_body() {
+    let env = TestEnv::new();
+    let json_ok = env
+        .req("POST", "/v1/__tick", Some(&json!({})), None)
+        .expect("JSON tick");
+    assert_eq!(json_ok["ticked"], json!(true));
+    // Empty POST body must also be fully consumed and succeed; this is the
+    // browser/UI scheduler path as well as the CLI bearer path.
+    let empty = env.raw(
+        "POST",
+        "/v1/__tick",
+        None,
+        &[("Authorization", "Bearer test-token")],
+    );
+    assert_eq!(empty.expect("empty tick")["ticked"], json!(true));
+}
+
+#[test]
 fn wp19_sse_mixed_window_resyncs_without_leaking_b() {
     let env = TestEnv::new_with_cli_scope();
     let (a_id, _) = env.ready_task("direct", Some("fake"), None);

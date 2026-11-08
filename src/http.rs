@@ -6,6 +6,7 @@ use crate::core::{Core, CoreError, SubmitInput};
 use crate::ids::{canonical_digest, new_token, sha256_hex};
 use crate::model::Role;
 use crate::routing;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -1057,13 +1058,27 @@ async fn resume_options(
     .into_response()
 }
 
-async fn tick(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+async fn tick(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
     let (bearer, cookie) = auth_context(&state, &headers);
-    if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
+    if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
         return r;
     }
-    state.core.scheduler_tick();
-    Json(json!({"ticked": true})).into_response()
+    // scheduler_tick performs Git/FS work. Keep it off the async worker so a
+    // response/connection cannot be reset while the runtime thread is blocked.
+    // Reading `_body` above deliberately drains the POST body (JSON or empty).
+    let core = state.core.clone();
+    match tokio::task::spawn_blocking(move || core.scheduler_tick()).await {
+        Ok(()) => Json(json!({"ticked": true})).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "scheduler_failed",
+            &format!("scheduler tick failed: {e}"),
+        ),
+    }
 }
 
 async fn get_request(State(state): State<SharedState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
