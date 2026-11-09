@@ -7,6 +7,76 @@ use std::time::Duration;
 
 pub const STDERR_CAP: usize = 2 * 1024 * 1024; // 2 MiB per attempt
 
+/// H4 stdout 分帧限长: a single stdout frame (newline-delimited) longer than this
+/// is DISCARDED WHOLE (never truncated mid-frame). An overlong frame cannot be a
+/// valid structured event; byte-bounded framing prevents both memory floods and
+/// the "half a dropped frame looks like a new event" failure.
+pub const LINE_CAP: usize = 1024 * 1024;
+
+/// WP23: byte-bounded, panic-free stdout framing shared by every platform loop.
+/// Feed raw chunks; complete frames (terminated by \n) come out as Strings.
+/// A frame over LINE_CAP — or an EOF tail over LINE_CAP — is dropped whole and
+/// counted; bytes after it still frame normally. UTF-8 boundaries can never
+/// panic because conversion happens only on whole retained frames.
+#[derive(Default)]
+pub struct FrameSplitter {
+    buf: Vec<u8>,
+}
+
+impl FrameSplitter {
+    pub fn push(&mut self, chunk: &[u8], out: &mut Vec<String>, dropped: &mut u64) {
+        self.buf.extend_from_slice(chunk);
+        loop {
+            let Some(pos) = self.buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            // drain the whole frame including the delimiter — no partial keeps
+            let frame: Vec<u8> = self.buf.drain(..=pos).collect();
+            let body = &frame[..frame.len() - 1];
+            if body.len() > LINE_CAP {
+                *dropped += 1;
+                continue;
+            }
+            let mut s = String::from_utf8_lossy(body).to_string();
+            if s.ends_with('\r') {
+                s.pop();
+            }
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        // unbounded growth guard: an unterminated run past 2×cap can never become
+        // a valid frame; drop the head so memory stays bounded (the tail of a
+        // flooder is meaningless, and we never emit it as a frame of its own —
+        // it stays unterminated until a real \n arrives or EOF discards it)
+        if self.buf.len() > LINE_CAP * 2 {
+            let excess = self.buf.len() - LINE_CAP * 2;
+            self.buf.drain(..excess);
+            *dropped += 1;
+        }
+    }
+
+    /// Test/boundary observation: bytes currently held for an unterminated frame.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn finish(&mut self, out: &mut Vec<String>, dropped: &mut u64) {
+        if self.buf.is_empty() {
+            return;
+        }
+        if self.buf.len() > LINE_CAP {
+            *dropped += 1;
+        } else {
+            let s = String::from_utf8_lossy(&self.buf).to_string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        self.buf.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
     pub exe: PathBuf,
@@ -757,7 +827,9 @@ pub fn launch(spec: &SpawnSpec) -> Result<RunningChild, String> {
 fn read_lines(h: winproc::SendHandle, tx: std::sync::mpsc::Sender<String>) {
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
     let h = h.0;
-    let mut buf: Vec<u8> = Vec::new();
+    let mut splitter = FrameSplitter::default();
+    let mut out: Vec<String> = Vec::new();
+    let mut dropped: u64 = 0;
     let mut chunk = [0u8; 65536];
     loop {
         let mut n: u32 = 0;
@@ -765,29 +837,123 @@ fn read_lines(h: winproc::SendHandle, tx: std::sync::mpsc::Sender<String>) {
         if ok == 0 || n == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..n as usize]);
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=pos).collect();
-            let mut s = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).to_string();
-            if s.ends_with('\r') {
-                s.pop();
-            }
-            if !s.is_empty() {
-                let _ = tx.send(s);
-            }
+        splitter.push(&chunk[..n as usize], &mut out, &mut dropped);
+        for s in out.drain(..) {
+            // a dead receiver only means nobody is listening; keep draining so
+            // the child cannot block on a full pipe (stop() still kills the tree)
+            let _ = tx.send(s);
         }
     }
-    if !buf.is_empty() {
-        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+    splitter.finish(&mut out, &mut dropped);
+    for s in out.drain(..) {
+        let _ = tx.send(s);
     }
     winproc::close_read(h);
 }
 
 #[cfg(not(windows))]
 fn read_lines_from_reader<R: std::io::Read>(r: &mut R, tx: std::sync::mpsc::Sender<String>) {
-    use std::io::BufRead;
-    let reader = std::io::BufReader::new(r);
-    for line in reader.lines().map_while(Result::ok) {
-        let _ = tx.send(line);
+    let mut splitter = FrameSplitter::default();
+    let mut out: Vec<String> = Vec::new();
+    let mut dropped: u64 = 0;
+    let mut chunk = [0u8; 65536];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                splitter.push(&chunk[..n], &mut out, &mut dropped);
+                for s in out.drain(..) {
+                    let _ = tx.send(s);
+                }
+            }
+        }
     }
+    splitter.finish(&mut out, &mut dropped);
+    for s in out.drain(..) {
+        let _ = tx.send(s);
+    }
+}
+
+/// WP22/WP25/WP26: run a probe subprocess with a hard timeout, require exit 0,
+/// and cap the captured output. Any overrun/nonzero exit/missing marker fails
+/// the contract. The caller supplies the FULL child environment — probes that
+/// must never see credentials pass an env without them. Pipes are drained on
+/// dedicated threads so the timeout can fire even when the child goes silent.
+/// Returns the capped stdout+stderr text.
+pub fn bounded_probe(
+    exe: &std::path::Path,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    env: &[(String, String)],
+    timeout: std::time::Duration,
+    accept: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    const PROBE_OUTPUT_CAP: usize = 1024 * 1024; // 1 MiB
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env_clear()
+        .envs(env.iter().cloned())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("probe spawn: {e}"))?;
+    fn drain_capped(pipe: Option<impl std::io::Read + Send + 'static>, cap: usize) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::default();
+        if let Some(mut pipe) = pipe {
+            let sink = buf.clone();
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 16384];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut s = sink.lock().unwrap();
+                            let take = n.min(cap.saturating_sub(s.len()));
+                            s.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                }
+            });
+        }
+        buf
+    }
+    let out_buf = drain_capped(child.stdout.take(), PROBE_OUTPUT_CAP);
+    let err_buf = drain_capped(child.stderr.take(), PROBE_OUTPUT_CAP);
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {}
+            Err(e) => return Err(format!("probe wait: {e}")),
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "probe timed out after {}s and was killed (fail closed)",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    if !status.success() {
+        return Err(format!(
+            "probe exited {:?} (nonzero exits never enable a capability)",
+            status.code()
+        ));
+    }
+    // give the drain threads a beat to flush the tail
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_buf.lock().unwrap()),
+        String::from_utf8_lossy(&err_buf.lock().unwrap())
+    );
+    if !accept(&text) {
+        return Err("probe output did not satisfy the contract".into());
+    }
+    Ok(text)
 }

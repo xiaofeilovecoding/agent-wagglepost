@@ -126,6 +126,9 @@ fn wp14_reroute_target_override_launches_the_approved_runtime() {
         cfg.codex_exe = stub;
         cfg.codex_version = Some("codex-cli 99.0.0-review-fixture".into());
     });
+    // H1: the stub's transport is verified by this fixture itself — record the
+    // same role-scoped, version-bound evidence a real loop would produce
+    env.seed_capability("codex", "codex-cli 99.0.0-review-fixture", &["writer", "reviewer"]);
     // allowed includes BOTH runtimes, so target=codex is permitted — and the
     // launch must actually be the codex fixture, never silently fake
     let task_id = blocked_task(&env, json!(["fake", "codex"]));
@@ -213,6 +216,7 @@ fn wp14_reroute_target_override_launches_the_approved_runtime() {
         cfg.codex_exe = stub;
         cfg.codex_version = Some("codex-cli 99.0.0-review-fixture".into());
     });
+    env2.seed_capability("codex", "codex-cli 99.0.0-review-fixture", &["writer", "reviewer"]);
     let t2 = blocked_task(&env2, json!(["fake", "codex"]));
     let digest2 = env2.relay_digest(&t2, None, None);
     let rev2 = env2.revision_of(&t2);
@@ -275,6 +279,7 @@ fn wp14b_no_handshake_never_announces_departure() {
         cfg.codex_exe = stub;
         cfg.codex_version = Some("codex-cli 99.0.0-review-fixture".into());
     });
+    env.seed_capability("codex", "codex-cli 99.0.0-review-fixture", &["writer", "reviewer"]);
     let body = json!({
         "goal": "no-handshake codex fixture (offline simulated)",
         "repo_path": env.user_repo.to_string_lossy(),

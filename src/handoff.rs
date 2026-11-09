@@ -2,7 +2,6 @@ use crate::ids::sha256_hex;
 use crate::model::*;
 
 pub const DEFAULT_BODY_BUDGET: usize = 8 * 1024;
-
 /// Truncated notice appended when content must be reduced to fit budget.
 pub const TRUNCATED_NOTICE_ZH: &str =
     "【蜂递】正文超出默认预算，以下材料经过裁剪；完整变更清单保存在受管工作区。";
@@ -30,6 +29,9 @@ pub fn result_contract_footer(lang: &'static str) -> String {
 }
 
 /// Assemble a handoff body for a role. Deterministic local assembly: zero model calls.
+/// Returns the body plus the U3 交接账单 (bill: what is included, what was left out
+/// and why, byte counts, digest binding) so the confirmation UI can show the exact
+/// scope the agent will receive.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble(
     mode: HandoffMode,
@@ -37,7 +39,7 @@ pub fn assemble(
     parts: HandoffParts,
     lang: &'static str,
     budget: usize,
-) -> Result<HandoffBody, String> {
+) -> Result<Assembled, String> {
     let mut sections: Vec<(String, String)> = Vec::new();
     let mut evidence_refs: Vec<String> = Vec::new();
 
@@ -140,36 +142,12 @@ pub fn assemble(
     }
 
     let footer = result_contract_footer(lang);
-    let mut text = String::new();
-    for (i, (title, body)) in sections.iter().enumerate() {
-        if !body.trim().is_empty() {
-            if i > 0 || !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&format!("## {title}\n{body}\n"));
-        }
-    }
-    text.push('\n');
-    text.push_str(&footer);
-
-    let bytes = text.as_bytes().len();
-    if bytes <= budget {
-        return Ok(finish(text, evidence_refs, mode, budget, bytes, None));
-    }
-    // over budget: trim the largest section bodies (keep required fields per contract),
-    // append truncation notice, never silently drop the result contract.
-    let mut trimmed: Vec<(String, String)> = sections
-        .into_iter()
-        .map(|(t, b)| {
-            let cap = budget / sections_len_hint(mode);
-            (t, trim_body(&b, cap))
-        })
-        .collect();
-    let rebuild = |secs: &[(String, String)]| -> String {
+    let footer_bytes = footer.as_bytes().len();
+    let build = |secs: &[(String, String)]| -> String {
         let mut t = String::new();
         for (i, (title, body)) in secs.iter().enumerate() {
             if !body.trim().is_empty() {
-                if i > 0 {
+                if i > 0 || !t.is_empty() {
                     t.push('\n');
                 }
                 t.push_str(&format!("## {title}\n{body}\n"));
@@ -178,40 +156,133 @@ pub fn assemble(
         t.push('\n');
         t
     };
-    let mut candidate_text = rebuild(&trimmed);
-    candidate_text.push_str(&footer);
-    // try removing optional sections entirely (evidence > key_changes > unresolved order kept last)
-    let optional_order = [zh_en(lang, "证据索引 / Evidence index", "Evidence index"),
-        zh_en(lang, "关键变更路径 / Key change paths", "Key change paths"),
-        zh_en(lang, "未解决项 / Unresolved items", "Unresolved items")];
-    for opt in optional_order.iter() {
-        if candidate_text.as_bytes().len() <= budget {
-            break;
+    let empty_or = |secs: &[(String, String)], i: usize| secs[i].1.trim().is_empty();
+    let _ = empty_or;
+
+    let bytes = build(&sections).as_bytes().len() + footer_bytes;
+    let mut trimmed: Vec<(String, String)> = sections.clone();
+    let mut truncated = false;
+    if bytes > budget {
+        truncated = true;
+        // trim the largest section bodies (keep required fields per contract),
+        // append truncation notice, never silently drop the result contract.
+        let cap = budget / sections_len_hint(mode);
+        for (_t, b) in trimmed.iter_mut() {
+            *b = trim_body(b, cap);
         }
-        let before = candidate_text.as_bytes().len();
-        trimmed.retain(|(t, _)| t != opt);
-        candidate_text = rebuild(&trimmed);
-        candidate_text.push_str(&footer);
-        if candidate_text.as_bytes().len() >= before {
-            break;
+        // try removing optional sections entirely (evidence > key_changes > unresolved)
+        let optional_order = [zh_en(lang, "证据索引 / Evidence index", "Evidence index"),
+            zh_en(lang, "关键变更路径 / Key change paths", "Key change paths"),
+            zh_en(lang, "未解决项 / Unresolved items", "Unresolved items")];
+        for opt in optional_order.iter() {
+            if build(&trimmed).as_bytes().len() + footer_bytes <= budget {
+                break;
+            }
+            let before = build(&trimmed).as_bytes().len();
+            trimmed.retain(|(t, _)| t != opt);
+            if build(&trimmed).as_bytes().len() >= before {
+                break;
+            }
         }
     }
-    let bytes2 = candidate_text.as_bytes().len();
-    if bytes2 > budget {
+    let mut text = build(&trimmed);
+    let bytes_final = text.as_bytes().len() + footer_bytes;
+    if bytes_final > budget {
         return Err(format!(
             "handoff body {} bytes exceeds budget {} even after trimming; reduce material or raise this dispatch limit",
-            bytes2, budget
+            bytes_final, budget
         ));
     }
-    let _ = trimmed.len();
-    Ok(finish(
-        candidate_text,
-        evidence_refs,
-        mode,
-        budget,
-        bytes2,
-        Some(TRUNCATED_NOTICE_ZH.to_string()),
-    ))
+    text.push_str(&footer);
+
+    // U3 交接账单: what the agent will actually receive, and what was left out.
+    let final_text_marker = |title: &str| text.contains(&format!("## {title}\n"));
+    let mut included: Vec<BillSection> = Vec::new();
+    let mut excluded: Vec<BillSection> = Vec::new();
+    for (title, body) in &sections {
+        let orig_bytes = body.as_bytes().len();
+        if body.trim().is_empty() {
+            excluded.push(BillSection {
+                title: title.clone(),
+                bytes: 0,
+                reason: Some("empty".into()),
+            });
+        } else if final_text_marker(title) {
+            let sent_bytes = trimmed
+                .iter()
+                .find(|(t, _)| t == title)
+                .map(|(_, b)| b.as_bytes().len())
+                .unwrap_or(0);
+            included.push(BillSection {
+                title: title.clone(),
+                bytes: sent_bytes,
+                reason: if truncated && sent_bytes < orig_bytes {
+                    Some("over_budget_trimmed".into())
+                } else {
+                    None
+                },
+            });
+        } else {
+            excluded.push(BillSection {
+                title: title.clone(),
+                bytes: orig_bytes,
+                reason: Some("over_budget_dropped".into()),
+            });
+        }
+    }
+    included.sort_by(|a, b| a.title.cmp(&b.title));
+    excluded.sort_by(|a, b| a.title.cmp(&b.title));
+
+    let body = finish(text, evidence_refs, mode, budget, bytes_final, if truncated {
+        Some(TRUNCATED_NOTICE_ZH.to_string())
+    } else {
+        None
+    });
+    let bill = HandoffBill {
+        mode: mode.as_str().into(),
+        bytes: body.bytes,
+        sha256: body.sha256.clone(),
+        budget_bytes: budget,
+        truncated,
+        included,
+        excluded,
+        footer_bytes,
+        comparison_bytes: None,
+    };
+    Ok(Assembled { body, bill })
+}
+
+/// U3 交接账单 for one assembled handoff: the exact scope the confirmation binds.
+#[derive(Clone, Debug, serde::Serialize, Default)]
+pub struct HandoffBill {
+    pub mode: String,
+    /// final body bytes (UTF-8), including the reporting contract footer
+    pub bytes: usize,
+    /// digest of the exact body this bill describes (approval binds this)
+    pub sha256: String,
+    pub budget_bytes: usize,
+    pub truncated: bool,
+    /// sections actually sent, with their sent byte counts
+    pub included: Vec<BillSection>,
+    /// sections left out, with the reason (empty / over_budget_trimmed / over_budget_dropped)
+    pub excluded: Vec<BillSection>,
+    /// bytes of the reporting contract footer (always present)
+    pub footer_bytes: usize,
+    /// bytes of the locally constructed comparison payload (对照), when computed
+    pub comparison_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Default)]
+pub struct BillSection {
+    pub title: String,
+    pub bytes: usize,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Assembled {
+    pub body: HandoffBody,
+    pub bill: HandoffBill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

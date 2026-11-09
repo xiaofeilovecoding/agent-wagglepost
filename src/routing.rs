@@ -51,6 +51,14 @@ pub fn reason(code: &'static str) -> Reason {
             "该运行时未通过写入能力门槛，不能承担写入角色",
             "Runtime has not passed the write-capability gate for a writer role",
         ),
+        "capability_unverified" => (
+            "该能力在本机版本上尚未验证；跑一次真实任务后自动验证",
+            "Capability not yet verified on this machine's version; it verifies after one real run",
+        ),
+        "capability_experimental" => (
+            "该运行时无法原生限制此角色，仅作实验/检测，不进入自动路由",
+            "Runtime cannot natively restrict this role; experimental/detection only, never auto-routed",
+        ),
         "scope_conflict" => (
             "允许路径与禁止项冲突",
             "Allowed paths conflict with forbidden paths",
@@ -90,7 +98,7 @@ pub struct RouteEvaluation {
     pub inputs: serde_json::Value,
 }
 
-/// Adapter runtime state as seen by routing (from doctor cache + live locks).
+/// Adapter runtime state as seen by routing (from the H1 capability table + live locks).
 pub struct AdapterRuntimeState {
     pub id: String,
     pub available: bool,
@@ -100,6 +108,8 @@ pub struct AdapterRuntimeState {
     pub resume_ok: bool,
     pub quota_blocked: bool,
     pub simulated: bool,
+    /// role capability cannot be natively restricted (实验/仅检测)
+    pub experimental: bool,
 }
 
 pub struct RouteInputs<'a> {
@@ -131,7 +141,13 @@ pub fn evaluate(inputs: &RouteInputs) -> RouteEvaluation {
             Role::Reviewer => st.readonly_ok,
         };
         if st.available && !role_ok {
-            reasons.push(reason("permission_insufficient"));
+            // H1: name WHY the role gate failed — unverified on this version vs a
+            // runtime that cannot natively restrict the role at all
+            reasons.push(reason(if st.experimental {
+                "capability_experimental"
+            } else {
+                "capability_unverified"
+            }));
         }
         if inputs.role == Role::Writer && !st.write_ok {
             reasons.push(reason("role_write_not_supported"));

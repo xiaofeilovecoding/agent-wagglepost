@@ -21,3 +21,31 @@ code{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere;font-siz
 @media(max-width:900px){.layout{grid-template-columns:1fr}.detail{grid-row:1}}
 @media(max-width:700px){.shell{display:block}.shell>main{min-width:0}.side{padding:10px 16px;flex-direction:row;justify-content:space-between;align-items:center;border-right:0;border-bottom:1px solid var(--line);gap:8px;flex-wrap:wrap}.nav{display:flex;gap:0;flex-wrap:wrap}.nav button{padding:6px 7px;font-size:12px}.local{display:none}.top{padding:6px 16px;flex-wrap:wrap}.top-controls{min-width:0;justify-content:flex-end}.content{padding:20px 16px}.station{grid-template-columns:29px minmax(0,1fr) auto}.station>span{min-width:0;overflow-wrap:anywhere}.taskrow .t-title{white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.tag{font-size:11px}.lineup{padding:12px}.footer{margin-top:14px}.motion-stage{padding:8px 12px}.motion-bar{font-size:12px}.motion-labels{font-size:11px}}
 @media(max-width:360px){.side{padding-inline:12px;flex-wrap:wrap}.logo{font-size:16px;gap:6px}.nav button{padding-inline:6px}}
+/* U1 agent status bar */
+.statusbar{border-bottom:1px solid var(--line);background:var(--surface);padding:7px 32px}
+.statusbar-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.agentchip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:999px;padding:4px 11px;min-height:34px;font-size:12.5px;background:var(--bg)}
+.agentchip.open{border-color:var(--brand);background:var(--accent)}
+.agentchip.b-decision{border-color:var(--warn);background:var(--amber)}
+.agentdot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.agentdot.d-decision{background:var(--warn)}
+.agentdot.d-running{background:var(--brand);box-shadow:0 0 0 3px var(--accent)}
+.agentdot.d-takable{background:var(--brand)}
+.agentname{font-weight:650}
+.agentstate{color:var(--muted)}
+.agentbadge{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--brand);color:var(--inverse);font-size:11px;font-weight:700}
+.agentchip.b-decision .agentbadge{background:var(--warn)}
+.agentdetail{padding:10px 14px;border-top:1px dashed var(--line);display:grid;gap:8px;font-size:13px}
+.agenttask{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.linkbtn{border:0;padding:2px 4px;min-height:0;text-decoration:underline;color:var(--brand);font-weight:650}
+/* U3 handoff bill */
+.handoff-bill{border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin:9px 0;background:var(--bg)}
+.bill-head{font-size:13px}
+.bill-list{list-style:none;margin:7px 0;padding:0;display:grid;gap:4px;font-size:12.5px}
+@media(max-width:700px){.statusbar{padding:6px 16px}}
+/* capability five-state tags (Tools page) */
+.cap-not-installed{opacity:.55}
+.cap-needs-config{background:var(--amber);color:var(--warn)}
+.cap-probed{background:var(--side);color:var(--muted)}
+.cap-verified{background:var(--brand);color:var(--inverse)}
+.cap-unsupported{background:var(--amber);color:var(--warn)}

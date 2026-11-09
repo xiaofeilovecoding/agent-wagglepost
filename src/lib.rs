@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod asset_guard;
+pub mod capability;
 pub mod core;
 pub mod events;
 pub mod fake_agent;

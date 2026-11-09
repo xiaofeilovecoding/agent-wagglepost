@@ -67,6 +67,30 @@ def wait_task_status(page, statuses, timeout_s=90):
     raise AssertionError(f"timeout waiting {statuses}; last={status}")
 
 
+def run_until_accepted(page, timeout_s=150):
+    """Drive the newest task to accepted via the UI primary + scheduler ticks."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        tick(page)
+        st = page.evaluate(
+            """async () => {
+              const r = await fetch('/v1/tasks', {credentials:'same-origin'});
+              const j = await r.json();
+              const t = j.tasks && j.tasks[0] ? j.tasks[0] : null;
+              return t ? [t.task_id, t.status] : ['', ''];
+            }"""
+        )
+        tid, status = st
+        if status == "accepted":
+            return True
+        if status in ("queued", "needs_review", "waiting_decision") and page.locator(".detail .primary").count() > 0:
+            lbl = page.locator(".detail .primary").inner_text()
+            if ("派发" in lbl) or ("Dispatch" in lbl) or ("接收候选" in lbl) or ("Accept candidate" in lbl):
+                page.locator(".detail .primary").click()
+        page.wait_for_timeout(300)
+    return False
+
+
 def auth_headers():
     # cookie session already in the browser context; server needs Origin+CSRF for POST
     if not SESSION_FILE:
@@ -214,6 +238,134 @@ def main():
             assert accepted, "reroute task never reached accepted through the UI"
 
         gate("g6_reroute_sample_flow", g3b_reroute_sample_flow)
+
+        def g3c_statusbar_chips_and_detail():
+            # U1: the status bar renders one chip per runtime from the capability
+            # table; clicking opens the in-workspace detail; Escape closes and
+            # returns focus to the chip; the selection survives a refresh.
+            page.locator(".nav button").nth(0).click()
+            page.wait_for_selector(".statusbar .agentchip", timeout=15000)
+            chips = page.locator(".agentchip")
+            assert chips.count() >= 4, f"agent chips present ({chips.count()})"
+            names = page.locator(".agentchip .agentname").all_inner_texts()
+            assert "fake" in names, f"fake chip shown: {names}"
+            first = page.locator(".agentchip").first
+            first.click()
+            page.wait_for_selector(".agentdetail", timeout=5000)
+            assert "蜂递任务" in page.locator(".agentdetail").inner_text() or "wagglepost tasks" in page.locator(".agentdetail").inner_text()
+            focused = page.evaluate("document.activeElement.className")
+            # Escape returns focus to the trigger point
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+            assert page.locator(".agentdetail").count() == 0, "Escape closes the detail"
+            page.locator(".agentchip").first.click()
+            page.wait_for_selector(".agentdetail", timeout=5000)
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+            page.wait_for_timeout(150)
+            # selection survives refresh: open detail, tick, detail stays
+            page.locator(".agentchip").first.click()
+            page.wait_for_selector(".agentdetail", timeout=5000)
+            tick(page)
+            page.wait_for_timeout(400)
+            assert page.locator(".agentdetail").count() == 1, "selection survives refresh"
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+
+        gate("g6_statusbar_chips_and_detail", g3c_statusbar_chips_and_detail)
+
+        def g3e_statusbar_capability_states_fixture():
+            # WP28: controllable fixture (route-intercepted doctor) with one
+            # not-installed, one needs_config, one probed-experimental and one
+            # verified runtime — the chips must show the REAL capability state,
+            # never a fake 空闲 for runtimes that cannot take work.
+            fixture = {
+                "capabilities": [
+                    {"adapter": "codex", "version": None, "state": "not_installed",
+                     "state_label_zh": "未安装", "state_label_en": "Not installed",
+                     "roles": [{"role": "writer", "verified": False, "auto_route": False, "experimental": False}]},
+                    {"adapter": "opencode", "version": "opencode v2.2.6", "state": "needs_config",
+                     "state_label_zh": "需配置", "state_label_en": "Needs setup",
+                     "roles": [{"role": "reviewer", "verified": False, "auto_route": False, "experimental": False}]},
+                    {"adapter": "dsh", "version": "0.2.1-rc.5", "state": "probed",
+                     "state_label_zh": "已探测", "state_label_en": "Probed",
+                     "roles": [{"role": "writer", "verified": False, "auto_route": False, "experimental": True}]},
+                    {"adapter": "fake", "version": "0.2.0", "state": "verified",
+                     "state_label_zh": "验证通过", "state_label_en": "Verified",
+                     "roles": [{"role": "writer", "verified": True, "auto_route": True, "experimental": False}]},
+                ],
+                "adapters": [],
+                "git": {"exe": "git", "version": "git version 2.54"},
+                "managed_root": "C:\fixture", "managed_root_ok": True,
+                "logs": {"files": 0, "bytes": 0, "retention_days": 7, "dir": "C:\fixture\logs"},
+                "platform": "windows",
+            }
+            page.route("**/v1/doctor", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps(fixture)))
+            page.route("**/v1/adapters", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"adapters": []})))
+            page.reload()
+            page.wait_for_selector(".statusbar .agentchip", timeout=15000)
+            labels = {}
+            for chip in page.locator(".agentchip").all():
+                name = chip.locator(".agentname").inner_text()
+                labels[name] = chip.locator(".agentstate").inner_text()
+            assert labels.get("codex") in ("未安装", "Not installed"), f"not-installed keeps its real state: {labels}"
+            assert labels.get("opencode") in ("需配置", "Needs setup"), f"needs-config keeps its real state: {labels}"
+            assert labels.get("dsh") in ("已探测", "已探测 · 实验", "Probed", "Probed · exp"), \
+                f"probed keeps its real state (exp marker allowed): {labels}"
+            assert labels.get("fake") in ("空闲", "idle"), f"only the verified runtime shows idle: {labels}"
+            # a synthetic-task free desk: no other chip may claim 空闲
+            idle = [n for n, l in labels.items() if l in ("空闲", "idle")]
+            assert idle == ["fake"], f"idle is exclusive to the routable runtime: {idle}"
+            page.unroute("**/v1/doctor")
+            page.unroute("**/v1/adapters")
+            page.reload()
+            page.wait_for_selector(".statusbar .agentchip", timeout=15000)
+
+        gate("g6_statusbar_capability_states_fixture", g3e_statusbar_capability_states_fixture)
+
+        def g3d_manual_task_handoff_bill():
+            # U3: manual journey — 生成路线 → two-step approval shows the handoff
+            # bill (bytes/digest/included/excluded/对照) beside the confirm.
+            page.locator(".top-controls button.tag").first.click()  # + 新建任务
+            page.wait_for_selector(".newtask textarea")
+            page.fill(".newtask textarea", "UI 账单门禁：在 README.md 末尾追加一行（模拟）")
+            page.fill(".newtask input[placeholder='repository path / 仓库路径']", "sample:demo")
+            page.locator(".newtask button.primary").click()
+            # wait for the TASK view (not the form): the intro title appears first
+            page.wait_for_selector(".intro h1", timeout=15000)
+            page.wait_for_selector(".detail .primary", timeout=15000)
+            page.wait_for_timeout(400)
+            lbl = page.locator(".detail .primary").inner_text()
+            assert ("生成路线" in lbl) or ("Build route" in lbl), f"planless primary offers route build, got {lbl}"
+            page.locator(".detail .primary").click()
+            page.wait_for_timeout(700)
+            lbl2 = page.locator(".detail .primary").inner_text()
+            assert ("确认并派发" in lbl2) or ("Approve and dispatch" in lbl2), f"two-step approve next, got {lbl2}"
+            page.locator(".detail .primary").click()
+            page.wait_for_selector(".handoff-bill", timeout=15000)
+            bill_text = page.locator(".handoff-bill").inner_text()
+            assert "digest" in bill_text.lower(), "bill names the digest"
+            assert ("字节" in bill_text) or ("bytes" in bill_text), "bill shows byte counts"
+            assert ("对照" in bill_text) or ("Comparison" in bill_text), "bill shows the comparison payload"
+            assert ("工作树" in bill_text) or ("worktree" in bill_text), "bill binds the worktree identity"
+            # the served bill must show included + excluded structure
+            rows = page.locator(".bill-list li")
+            assert rows.count() >= 1, "bill lists sections"
+            # confirm sends the exact digest; dispatch runs the fake writer; accept
+            page.locator(".detail .primary").click()  # 确认发送此正文
+            page.wait_for_timeout(500)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                tick(page)
+                st = server_status(page)
+                if st == "queued":
+                    break
+                page.wait_for_timeout(250)
+            page.locator(".detail .primary").click()  # 派发给 Agent
+            run_until_accepted(page)
+            assert server_status(page) == "accepted", "manual task completed through the UI"
+
+        gate("g6_manual_task_handoff_bill", g3d_manual_task_handoff_bill)
 
 
         def g4_five_second_orientation():

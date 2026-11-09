@@ -24,7 +24,7 @@ fn real_main(args: Vec<String>) -> i32 {
         "doctor" => cmd_doctor(rest),
         "__fake-agent" => cmd_fake_agent(rest),
         // CLI subcommands that talk to a running server
-        "submit" | "status" | "inbox" | "request" | "answer" | "why" | "dispatch" | "accept" | "cancel" | "plan" | "approve" => cmd_client(cmd, rest),
+        "submit" | "status" | "inbox" | "request" | "answer" | "why" | "dispatch" | "accept" | "cancel" | "plan" | "approve" | "verify" => cmd_client(cmd, rest),
         "--help" | "-h" | "help" => {
             print_usage();
             0
@@ -39,11 +39,12 @@ fn real_main(args: Vec<String>) -> i32 {
 
 fn print_usage() {
     eprintln!(
-        "wagglepost 0.1 — 蜂递：本地多 Agent 路由 / local multi-agent router\n\
+        "wagglepost 0.2 — 蜂递：本地多 Agent 路由 / local multi-agent router\n\
          \n\
          USAGE:\n\
            wagglepost serve [--port N] [--managed-root DIR] [--cli-repo DIR]...\n\
            wagglepost doctor [--json]                            runtime capability check\n\
+           wagglepost verify <adapter>                           offline no-account capability contract\n\
            wagglepost submit --file draft.json --json            submit a task draft\n\
            wagglepost status <task_id> --json                    task snapshot\n\
            wagglepost inbox [--after SEQ] --json                 inbox messages\n\
@@ -218,8 +219,16 @@ fn cmd_doctor(args: Vec<String>) -> i32 {
             let v = a["version"].as_str().unwrap_or("-");
             let ok = a["available"].as_bool().unwrap_or(false);
             let sim = a["simulated"].as_bool().unwrap_or(false);
+            let state = a["state_label_zh"].as_str().unwrap_or("");
+            let exp = if a["writer_experimental"].as_bool().unwrap_or(false)
+                || a["reviewer_experimental"].as_bool().unwrap_or(false)
+            {
+                " 实验/仅检测"
+            } else {
+                ""
+            };
             println!(
-                "  {id:<8} {} {} {}",
+                "  {id:<8} {} {} {} [{state}{exp}]",
                 if ok { "OK " } else { "MISSING" },
                 v,
                 if sim { "(simulated)" } else { "" }
@@ -472,6 +481,14 @@ fn cmd_client(cmd: String, args: Vec<String>) -> i32 {
             let id = args.first().cloned().unwrap_or_default();
             let rid = format!("cli-{}", wagglepost::ids::new_token()[..12].to_string());
             http_req(port, &token, &csrf, "POST", &format!("/v1/tasks/{id}/dispatch"), Some(&json!({})), Some(&rid))
+        }
+        "verify" => {
+            let id = args.first().cloned().unwrap_or_default();
+            if id.is_empty() {
+                eprintln!("verify needs an adapter id (opencode | dsh | codex | claude | fake)");
+                return 2;
+            }
+            http_req(port, &token, &csrf, "POST", &format!("/v1/adapters/{id}/verify"), Some(&json!({})), None)
         }
         "accept" => {
             let id = args.first().cloned().unwrap_or_default();

@@ -161,6 +161,26 @@ impl TestEnv {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// H1: seed a capability verification record for a fixture runtime whose
+    /// transport the test itself stands in for (e.g. the offline codex version
+    /// stub). Verification is role-scoped and version-bound, exactly like a
+    /// real-loop record.
+    pub fn seed_capability(&self, adapter: &str, version: &str, roles: &[&str]) {
+        // bind the CURRENT probe executable — a fixture stands in for that binary
+        let rec = self.core.probe_record(adapter);
+        let exe_path = rec.executable.clone();
+        let exe_sha256 = exe_path.as_deref().and_then(|p| wagglepost::core::exe_sha256(std::path::Path::new(p)));
+        let ver = wagglepost::capability::VerificationRecord {
+            version: version.to_string(),
+            verified_at: "fixture".into(),
+            evidence: wagglepost::capability::EVID_OFFLINE_CONTRACT.into(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+            exe_path,
+            exe_sha256,
+        };
+        wagglepost::capability::save_verified(&self.core.store, adapter, &ver);
+    }
+
     pub fn req(
         &self,
         method: &str,

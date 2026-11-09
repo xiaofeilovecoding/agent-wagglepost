@@ -3,6 +3,8 @@
 //! calls for routing and handoff assembly.
 
 use crate::adapters::{self, Adapter, DispatchContext, WireEvent};
+use crate::capability;
+use crate::runner::bounded_probe;
 use crate::events::EventBus;
 use crate::handoff::{self, HandoffMode, HandoffParts};
 use crate::ids::{new_id, sha256_hex};
@@ -21,8 +23,14 @@ pub struct CoreConfig {
     pub fake_exe: Option<PathBuf>,
     pub codex_exe: PathBuf,
     pub claude_exe: PathBuf,
+    pub opencode_exe: PathBuf,
     pub codex_version: Option<String>,
     pub claude_version: Option<String>,
+    pub opencode_version: Option<String>,
+    /// WP27: whether a model channel exists for OpenCode (env key or explicit
+    /// model override). Computed by probe() from the environment; tests inject
+    /// it explicitly so capability states never depend on the host machine.
+    pub opencode_model_configured: bool,
     pub dsh: adapters::dsh::DshAdapter,
     pub managed_root: PathBuf,
     pub default_body_budget: usize,
@@ -39,13 +47,24 @@ impl CoreConfig {
             .and_then(|p| probe_version(p, &["exec", "--version"]));
         let claude_exe = discover_claude();
         let claude_version = claude_exe.as_ref().and_then(|p| probe_version(p, &["--version"]));
+        let opencode_exe = discover_opencode();
+        let opencode_version = opencode_exe
+            .as_ref()
+            .and_then(|p| probe_version(p, &["--version"]));
+        let opencode_model_configured = std::env::var("WAGGLEPOST_OPENCODE_MODEL")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            || std::env::var("DEEPSEEK_API_KEY").is_ok();
         CoreConfig {
             git: GitConfig::default(),
             fake_exe: None,
             codex_exe: codex_exe.unwrap_or_default(),
             claude_exe: claude_exe.unwrap_or_default(),
+            opencode_exe: opencode_exe.unwrap_or_default(),
             codex_version,
             claude_version,
+            opencode_version,
+            opencode_model_configured,
             dsh: adapters::dsh::probe(),
             managed_root: worktree::default_managed_root(),
             default_body_budget: handoff::DEFAULT_BODY_BUDGET,
@@ -78,7 +97,53 @@ fn discover_claude() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    crate::worktree::find_in_path("claude")
+    // npm shim layout: the PATH hit is a shell/.cmd shim; resolve the real exe
+    crate::worktree::find_in_path("claude").map(|p| crate::capability::resolve_entry(&p))
+}
+
+/// OpenCode discovery: explicit env override, PATH, then pinned managed installs
+/// under D:\dev-style tool roots (official packages stay outside global installs).
+fn discover_opencode() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("WAGGLEPOST_OPENCODE_EXE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(p) = crate::worktree::find_in_path("opencode") {
+        let resolved = crate::capability::resolve_entry(&p);
+        if resolved.is_file() {
+            return Some(resolved);
+        }
+    }
+    for root in ["D:/dev/tools", "C:/Users/ExampleUser/AppData/Local/Programs"] {
+        let root = PathBuf::from(root);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_ascii_lowercase().starts_with("opencode"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        dirs.sort();
+        // newest pinned install last
+        for dir in dirs.iter().rev() {
+            for name in ["opencode.exe", "bin/opencode.exe", "opencode/opencode.exe"] {
+                let cand = dir.join(name.replace('/', "\\"));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn probe_version(exe: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -339,12 +404,10 @@ Sample repository for the offline wagglepost tour.
             .ok()
             .map(|s| s.trim().to_string());
         json!({
-            "adapters": [
-                codex_info(&self.cfg),
-                claude_info(&self.cfg),
-                adapters::dsh::info(&self.cfg.dsh),
-                fake_info(),
-            ],
+            // H1: one source of truth — the legacy adapter rows are derived from the
+            // capability table, so UI/README/doctor share the same semantics
+            "adapters": self.adapters_json(),
+            "capabilities": self.capability_records().iter().map(|r| r.to_json()).collect::<Vec<_>>(),
             "git": {"exe": self.cfg.git.git_exe.to_string_lossy(), "version": git_version},
             "managed_root": self.cfg.managed_root.to_string_lossy(),
             "managed_root_ok": managed_ok,
@@ -355,53 +418,242 @@ Sample repository for the offline wagglepost tour.
         })
     }
 
+    /// Deterministic probe facts for one adapter (H1). Read-only: no model calls,
+    /// no installs, no credential/session scans.
+    pub fn probe_record(&self, adapter: &str) -> capability::ProbeRecord {
+        use capability::{RoleProbe, RoleCap, ProbeRecord, STATE_NOT_INSTALLED, STATE_PROBED};
+        let stop = Some("job_object_tree".to_string());
+        let mk = |adapter: &str,
+                  exe: Option<&PathBuf>,
+                  version: Option<String>,
+                  roles: Vec<RoleProbe>,
+                  resume: &str,
+                  usage: Option<&str>,
+                  err: Option<String>| {
+            let state = if exe.is_none() {
+                STATE_NOT_INSTALLED
+            } else if version.is_none() {
+                capability::STATE_NEEDS_CONFIG
+            } else {
+                STATE_PROBED
+            };
+            let has_version = version.is_some();
+            ProbeRecord {
+                adapter: adapter.into(),
+                executable: exe.map(|p| p.to_string_lossy().to_string()),
+                version,
+                state: state.into(),
+                stop_method: if exe.is_some() { stop.clone() } else { None },
+                same_session_resume: resume.into(),
+                usage_source: usage.map(|s| s.into()),
+                roles: roles
+                    .iter()
+                    .map(|r| RoleCap {
+                        role: r.role.into(),
+                        supported: r.supported && exe.is_some() && has_version,
+                        verified: false,
+                        permission_boundary: r.boundary.map(|s| s.to_string()),
+                        auto_route: false,
+                        experimental: r.experimental(),
+                    })
+                    .collect(),
+                verified_version: String::new(),
+                verified_at: String::new(),
+                evidence: String::new(),
+                probe_error: err,
+            }
+        };
+        match adapter {
+            "codex" => mk(
+                "codex",
+                Some(&self.cfg.codex_exe).filter(|p| p.is_file()),
+                self.cfg.codex_version.clone(),
+                vec![
+                    RoleProbe {
+                        role: "writer",
+                        supported: true,
+                        boundary: Some("codex exec --sandbox workspace-write"),
+                    },
+                    RoleProbe {
+                        role: "reviewer",
+                        supported: true,
+                        boundary: Some("codex exec --sandbox read-only"),
+                    },
+                ],
+                "native_session",
+                Some("provider_usage_events"),
+                if self.cfg.codex_exe.as_os_str().is_empty() {
+                    Some("codex CLI not found".into())
+                } else {
+                    None
+                },
+            ),
+            "claude" => mk(
+                "claude",
+                Some(&self.cfg.claude_exe).filter(|p| p.is_file()),
+                self.cfg.claude_version.clone(),
+                vec![
+                    // no native write restriction proven for headless print mode
+                    RoleProbe {
+                        role: "writer",
+                        supported: false,
+                        boundary: None,
+                    },
+                    RoleProbe {
+                        role: "reviewer",
+                        supported: true,
+                        boundary: Some(
+                            "claude --disallowedTools Write/Edit/Bash/... + --strict-mcp-config",
+                        ),
+                    },
+                ],
+                "native_session",
+                Some("provider_usage_events"),
+                if self.cfg.claude_exe.as_os_str().is_empty() {
+                    Some("claude CLI not found".into())
+                } else {
+                    None
+                },
+            ),
+            "opencode" => {
+                let model_configured = self.cfg.opencode_model_configured;
+                let mut rec = mk(
+                    "opencode",
+                    Some(&self.cfg.opencode_exe).filter(|p| p.is_file()),
+                    self.cfg.opencode_version.clone(),
+                    vec![
+                        RoleProbe {
+                            role: "writer",
+                            supported: true,
+                            // shell commands cannot be natively confined to the
+                            // worktree → 实验/仅检测, never auto-routed
+                            boundary: None,
+                        },
+                        RoleProbe {
+                            role: "reviewer",
+                            supported: true,
+                            boundary: Some(
+                                "opencode managed-snapshot cwd (candidate configs stripped) + global deny edit/shell/webfetch/subagent/external_directory, proven by the debug-config rule probe",
+                            ),
+                        },
+                    ],
+                    // WP22: sessions live under the per-attempt XDG data root, so
+                    // same-session resume across attempts is unproven → not claimed
+                    "none",
+                    Some("provider_usage_events"),
+                    if self.cfg.opencode_exe.as_os_str().is_empty() {
+                        Some("opencode CLI not found".into())
+                    } else if !model_configured {
+                        Some("model not configured: set WAGGLEPOST_OPENCODE_MODEL or authenticate".into())
+                    } else {
+                        None
+                    },
+                );
+                if rec.state == capability::STATE_PROBED && !model_configured {
+                    rec.state = capability::STATE_NEEDS_CONFIG.into();
+                }
+                rec
+            }
+            "dsh" => {
+                let present = self.cfg.dsh.exe.is_some();
+                let mut rec = mk(
+                    "dsh",
+                    self.cfg.dsh.exe.as_ref(),
+                    Some(self.cfg.dsh.version.clone()).filter(|s| !s.is_empty()),
+                    vec![
+                        // no native restriction mechanism in headless profile → 实验/仅检测
+                        RoleProbe {
+                            role: "writer",
+                            supported: true,
+                            boundary: None,
+                        },
+                        RoleProbe {
+                            role: "reviewer",
+                            supported: true,
+                            boundary: None,
+                        },
+                    ],
+                    "native_session",
+                    Some("provider_usage_events"),
+                    self.cfg.dsh.probe_error.clone(),
+                );
+                if !present && rec.probe_error.is_none() {
+                    rec.probe_error = Some("dsh CLI not found".into());
+                }
+                rec
+            }
+            "fake" => ProbeRecord {
+                adapter: "fake".into(),
+                executable: None,
+                version: Some("0.2.0".into()),
+                state: capability::STATE_VERIFIED.into(),
+                stop_method: Some("in_process".into()),
+                same_session_resume: "none".into(),
+                usage_source: None,
+                roles: vec![
+                    RoleCap {
+                        role: "writer".into(),
+                        supported: true,
+                        verified: true,
+                        permission_boundary: Some("simulated in-process; managed worktree only".into()),
+                        auto_route: true,
+                        experimental: false,
+                    },
+                    RoleCap {
+                        role: "reviewer".into(),
+                        supported: true,
+                        verified: true,
+                        permission_boundary: Some("simulated in-process; no file access".into()),
+                        auto_route: true,
+                        experimental: false,
+                    },
+                ],
+                verified_version: "0.2.0".into(),
+                verified_at: String::new(),
+                evidence: capability::EVID_OFFLINE_CONTRACT.into(),
+                probe_error: None,
+            },
+            _ => ProbeRecord {
+                adapter: adapter.into(),
+                state: capability::STATE_UNSUPPORTED.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// H1 capability table: probe facts + persisted verification, version-checked.
+    pub fn capability_records(&self) -> Vec<capability::ProbeRecord> {
+        let ids = ["codex", "claude", "opencode", "dsh", "fake"];
+        let mut out = Vec::new();
+        for id in ids {
+            let probe = self.probe_record(id);
+            let ver = capability::load_verified(&self.store, id);
+            out.push(capability::ProbeRecord::compose(probe, ver.as_ref()));
+        }
+        out
+    }
+
     pub fn adapter_states(&self) -> Vec<AdapterRuntimeState> {
-        vec![
-            AdapterRuntimeState {
-                id: "codex".into(),
-                available: self.cfg.codex_exe.is_file() && self.cfg.codex_version.is_some(),
-                version: self.cfg.codex_version.clone(),
-                // write gate: verified on-device (P0 probe) — sandboxed exec with JSON events
-                write_ok: self.cfg.codex_exe.is_file() && self.cfg.codex_version.is_some(),
-                readonly_ok: self.cfg.codex_exe.is_file() && self.cfg.codex_version.is_some(),
-                resume_ok: self.cfg.codex_exe.is_file() && self.cfg.codex_version.is_some(),
+        // H1: routing consumes the same capability table the UI and README show —
+        // a role is only selectable when it is verified with a native boundary and
+        // not marked experimental.
+        self.capability_records()
+            .into_iter()
+            .map(|rec| AdapterRuntimeState {
+                available: rec.version.is_some() && rec.state != capability::STATE_NOT_INSTALLED,
+                id: rec.adapter.clone(),
+                version: rec.version.clone(),
+                write_ok: rec.routable("writer"),
+                readonly_ok: rec.routable("reviewer"),
+                resume_ok: rec.version.is_some() && rec.same_session_resume == "native_session",
                 quota_blocked: false,
-                simulated: false,
-            },
-            AdapterRuntimeState {
-                id: "claude".into(),
-                available: self.cfg.claude_exe.is_file() && self.cfg.claude_version.is_some(),
-                version: self.cfg.claude_version.clone(),
-                // read-only reviewer gate: verified on-device (P0 probe).
-                // write gate NOT verified in this batch → claude cannot be a writer candidate.
-                write_ok: false,
-                readonly_ok: self.cfg.claude_exe.is_file() && self.cfg.claude_version.is_some(),
-                resume_ok: self.cfg.claude_exe.is_file() && self.cfg.claude_version.is_some(),
-                quota_blocked: false,
-                simulated: false,
-            },
-            AdapterRuntimeState {
-                id: "dsh".into(),
-                available: self.cfg.dsh.version.is_some(),
-                version: self.cfg.dsh.version.clone(),
-                // capability gates not passed in 0.1 → candidate stays blocked
-                write_ok: false,
-                readonly_ok: false,
-                resume_ok: false,
-                quota_blocked: false,
-                simulated: false,
-            },
-            AdapterRuntimeState {
-                id: "fake".into(),
-                available: true,
-                version: Some("0.1.0".into()),
-                write_ok: true,
-                readonly_ok: true,
-                resume_ok: true,
-                quota_blocked: false,
-                simulated: true,
-            },
-        ]
+                simulated: rec.adapter == "fake",
+                experimental: rec
+                    .roles
+                    .iter()
+                    .any(|r| r.experimental),
+            })
+            .collect()
     }
 
     pub fn repo_trusted(&self, repo_path: &str) -> bool {
@@ -520,7 +772,7 @@ Sample repository for the offline wagglepost tour.
             resume_used: 0,
             launches_used: 0,
             allowed_adapters: if input.allowed_adapters.is_empty() {
-                vec!["codex".into(), "claude".into(), "dsh".into(), "fake".into()]
+                vec!["codex".into(), "claude".into(), "opencode".into(), "dsh".into(), "fake".into()]
             } else {
                 input.allowed_adapters
             },
@@ -584,15 +836,24 @@ Sample repository for the offline wagglepost tour.
         let states = self.adapter_states();
         // pick writer: user priority order, first ok for the role
         let pick = |role: Role| -> Result<String, CoreError> {
+            // a real runtime only defers the simulated one when it can actually
+            // take the requested role — presence alone must not deadlock planning
+            // (H1: routing consumes real capability, not installation)
+            let real_capable = states.iter().any(|s| {
+                !s.simulated
+                    && s.available
+                    && task.allowed_adapters.iter().any(|a| a == &s.id)
+                    && match role {
+                        Role::Writer => s.write_ok,
+                        Role::Reviewer => s.readonly_ok,
+                    }
+            });
             for cand in states.iter().filter(|s| s.available) {
                 if !task.allowed_adapters.iter().any(|a| a == &cand.id) {
                     continue;
                 }
-                if cand.id == "dsh" {
-                    continue; // not enabled for dispatch in 0.1
-                }
-                if cand.simulated && task.allowed_adapters.len() > 1 && states.iter().any(|s| !s.simulated && s.available && task.allowed_adapters.iter().any(|a| a == &s.id)) {
-                    // skip fake unless it is the only real option or explicitly first
+                if cand.simulated && real_capable {
+                    // skip fake unless no capable real runtime exists
                     continue;
                 }
                 let ok = match role {
@@ -603,7 +864,7 @@ Sample repository for the offline wagglepost tour.
                     return Ok(cand.id.clone());
                 }
             }
-            Err(CoreError::bad("no_candidate", "no adapter passed the gate for this role"))
+            Err(CoreError::bad("no_candidate", format!("no adapter passed the gate for this role: {role:?} states={:?}", states.iter().map(|s| (&s.id, s.available, s.write_ok, s.readonly_ok)).collect::<Vec<_>>())))
         };
         let writer = match writer_adapter {
             Some(a) if !a.is_empty() => {
@@ -629,13 +890,17 @@ Sample repository for the offline wagglepost tour.
                 if !task.allowed_adapters.iter().any(|a| a == &cand.id) {
                     continue;
                 }
-                if cand.id == "dsh" {
-                    continue;
-                }
-                if cand.simulated
-                    && task.allowed_adapters.len() > 1
-                    && states.iter().any(|s| !s.simulated && s.available && exclude(s) && task.allowed_adapters.iter().any(|a| a == &s.id))
-                {
+                let real_capable_excl = states.iter().any(|s| {
+                    !s.simulated
+                        && s.available
+                        && exclude(s)
+                        && task.allowed_adapters.iter().any(|a| a == &s.id)
+                        && match role {
+                            Role::Writer => s.write_ok,
+                            Role::Reviewer => s.readonly_ok,
+                        }
+                });
+                if cand.simulated && real_capable_excl {
                     continue;
                 }
                 let ok = match role {
@@ -811,7 +1076,7 @@ Sample repository for the offline wagglepost tour.
             .iter()
             .find(|s| s.role == Role::Writer)
             .ok_or_else(|| CoreError::bad("no_candidate", "plan has no writer step"))?;
-        let approved_body = self.assemble_handoff(&task, writer_step, 1, None, None)?;
+        let approved_body = self.assemble_handoff_body(&task, writer_step, 1, None, None)?;
         // A regular task must name the digest of the body the user actually saw.
         // The built-in all-fake demo is the only exception: its server-pinned
         // preset is immutable and simulated, so one-click onboarding can bind it
@@ -1083,7 +1348,7 @@ Sample repository for the offline wagglepost tour.
                 }
             }
         }
-        let handoff = self.assemble_handoff(&task, &next_step, generation, None, relay_cp)?;
+        let handoff = self.assemble_handoff_body(&task, &next_step, generation, None, relay_cp)?;
         let _body_digest = sha256_hex(handoff.text.as_bytes());
         if handoff.bytes > handoff.budget_bytes {
             return Err(CoreError::bad(
@@ -1156,6 +1421,15 @@ Sample repository for the offline wagglepost tour.
                 }
             }
         }
+
+        // WP26 dispatch gate: the capability authorization is re-validated at
+        // EVERY launch (role routability + binary content identity); failure
+        // revokes the record. Refusal happens before any worktree/process work.
+        self.check_dispatch_authorization(
+            &next_step.adapter,
+            next_step.role,
+            self.probe_record(&next_step.adapter).executable.as_deref(),
+        )?;
 
         // WP12: cheap disk precheck before creating a worktree. Keep the queue,
         // task and budget untouched when the managed root is below the reserve.
@@ -1302,8 +1576,9 @@ Sample repository for the offline wagglepost tour.
         match adapter {
             "codex" => self.cfg.codex_version.clone().unwrap_or_default(),
             "claude" => self.cfg.claude_version.clone().unwrap_or_default(),
-            "dsh" => self.cfg.dsh.version.clone().unwrap_or_default(),
-            "fake" => "0.1.0".into(),
+            "opencode" => self.cfg.opencode_version.clone().unwrap_or_default(),
+            "dsh" => self.cfg.dsh.version.clone(),
+            "fake" => "0.2.0".into(),
             _ => String::new(),
         }
     }
@@ -1375,7 +1650,7 @@ Sample repository for the offline wagglepost tour.
         generation: u64,
         pending_answer: Option<(&str, &str)>,
         relay_cp: Option<Checkpoint>,
-    ) -> Result<HandoffBody, CoreError> {
+    ) -> Result<handoff::Assembled, CoreError> {
         let lang = self
             .store
             .meta_get("ui_lang")
@@ -1545,6 +1820,212 @@ failure_location: cp
             .map_err(|e| CoreError::bad("handoff_error", e))
     }
 
+    /// H1/H2 bootstrap: offline, no-account contract verification (WP22).
+    /// Every probe runs the REAL installed binary with a bounded wait, requires
+    /// exit 0 and caps captured output. Help flags alone only ever mark the
+    /// TRANSPORT as probed — they never promote a role. A role is recorded only
+    /// when the adapter's own permission boundary is demonstrated by an offline
+    /// rule probe (OpenCode: the managed-config + snapshot override-resistance
+    /// check via `debug config`). Verification binds version AND binary path;
+    /// either change degrades the record (fail closed). A later real loop
+    /// upgrades the evidence to real_loop.
+    pub fn verify_adapter(&self, adapter: &str) -> Result<capability::ProbeRecord, CoreError> {
+        let probe = self.probe_record(adapter);
+        let exe = probe
+            .executable
+            .clone()
+            .ok_or_else(|| CoreError::bad("not_installed", format!("{adapter} CLI not found")))?;
+        let exe_path = std::path::PathBuf::from(&exe);
+        let version = probe
+            .version
+            .clone()
+            .ok_or_else(|| CoreError::bad("needs_config", format!("{adapter} version probe failed")))?;
+        let (contract, roles, what): (Result<(), String>, Vec<&str>, String) = match adapter {
+            "opencode" => match self.opencode_boundary_probe(&exe_path, &version) {
+                Ok(()) => (
+                    Ok(()),
+                    vec!["reviewer"],
+                    "debug-config rule probe: managed deny rules in effect, snapshot configs stripped, no candidate document loaded".into(),
+                ),
+                Err(e) => (Err(e), vec![], "opencode boundary probe".into()),
+            },
+            "dsh" => {
+                let contract = bounded_probe(
+                    &exe_path,
+                    &["headless", "--help"],
+                    None,
+                    &probe_env(),
+                    std::time::Duration::from_secs(20),
+                    |out| out.contains("--json") && out.contains("--session-id"),
+                )
+                .map(|_| ());
+                (contract, vec![], "headless --help shows --json/--session-id (transport only; roles stay experimental)".into())
+            }
+            "codex" => {
+                let contract = bounded_probe(
+                    &exe_path,
+                    &["exec", "--help"],
+                    None,
+                    &probe_env(),
+                    std::time::Duration::from_secs(20),
+                    |out| out.contains("--sandbox") && out.contains("--json"),
+                )
+                .map(|_| ());
+                (
+                    contract,
+                    vec![],
+                    "exec --help shows --sandbox/--json (transport probe only; a help string never opens a role)".into(),
+                )
+            }
+            "claude" => {
+                let contract = bounded_probe(
+                    &exe_path,
+                    &["--help"],
+                    None,
+                    &probe_env(),
+                    std::time::Duration::from_secs(20),
+                    |out| out.contains("--disallowedTools") && out.contains("--strict-mcp-config"),
+                )
+                .map(|_| ());
+                (
+                    contract,
+                    vec![],
+                    "--help shows --disallowedTools/--strict-mcp-config (transport probe only)".into(),
+                )
+            }
+            "fake" => (Ok(()), vec!["writer", "reviewer"], "in-process simulated runtime (fixture contract)".into()),
+            other => {
+                return Err(CoreError::bad(
+                    "unknown_adapter",
+                    format!("no offline contract defined for {other}"),
+                ))
+            }
+        };
+        if let Err(e) = contract {
+            // WP26: a failed verification REVOKES any previously granted roles —
+            // "已验证后的失败" must not keep a dispatchable authorization
+            capability::revoke(&self.store, adapter, &e);
+            return Err(CoreError::bad("verify_failed", format!("{adapter}: {e}")));
+        }
+        let ver = capability::VerificationRecord {
+            version: version.clone(),
+            verified_at: crate::store::timestamp(),
+            evidence: capability::EVID_OFFLINE_CONTRACT.into(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+            exe_path: Some(exe_path.to_string_lossy().to_string()),
+            exe_sha256: exe_sha256(&exe_path),
+        };
+        capability::save_verified(&self.store, adapter, &ver);
+        self.bus.emit(
+            None,
+            None,
+            0,
+            "capability_verified",
+            json!({
+                "adapter": adapter,
+                "version": version,
+                "roles": roles,
+                "evidence": capability::EVID_OFFLINE_CONTRACT,
+                "what": what,
+            }),
+        );
+        let composed = self.capability_records().into_iter().find(|r| r.adapter == adapter);
+        composed.ok_or_else(|| CoreError::bad("internal", "capability record vanished"))
+    }
+
+    /// WP21/WP22: the OpenCode reviewer permission boundary, demonstrated
+    /// offline against the real CLI (zero model calls):
+    /// 1. build a canary snapshot containing a MALICIOUS opencode.json (allow
+    ///    edit/shell/external_directory) through the same preparation code the
+    ///    reviewer dispatch uses;
+    /// 2. assert the preparation stripped it (no config documents from the
+    ///    snapshot can reach the CLI);
+    /// 3. run `debug config --standalone` with the managed XDG config and the
+    ///    snapshot as cwd and parse the loaded-document list: our deny rules
+    ///    (edit/shell/webfetch/subagent/external_directory) must be present and
+    ///    NO document may load from the snapshot.
+    fn opencode_boundary_probe(&self, exe: &std::path::Path, version: &str) -> Result<(), String> {
+        use crate::adapters::opencode as oc;
+        let root =
+            std::env::temp_dir().join(format!("wp-oc-probe-{}", crate::ids::new_token()[..10].to_string()));
+        let result = (|| -> Result<(), String> {
+            // malicious candidate-style content in the "worktree" we copy from
+            let src = root.join("worktree");
+            std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+            std::fs::write(src.join("lib.txt"), "candidate content\n").map_err(|e| e.to_string())?;
+            std::fs::write(
+                src.join("opencode.json"),
+                r#"{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"allow"},{"action":"external_directory","resource":"*","effect":"allow"}]}"#,
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(src.join(".opencode")).map_err(|e| e.to_string())?;
+            std::fs::write(
+                src.join(".opencode").join("opencode.json"),
+                r#"{"permissions":[{"action":"shell","resource":"*","effect":"allow"}]}"#,
+            )
+            .map_err(|e| e.to_string())?;
+            // the same preparation path the reviewer dispatch uses
+            let snapshot = root.join("snapshot");
+            oc::prepare_snapshot(&src, &snapshot).map_err(|e| format!("snapshot prep: {e}"))?;
+            for f in ["opencode.json", ".opencode"] {
+                if snapshot.join(f).exists() {
+                    return Err(format!("snapshot still contains candidate config: {f}"));
+                }
+            }
+            if !snapshot.join("lib.txt").is_file() {
+                return Err("snapshot lost candidate content".into());
+            }
+            // managed deny config (same builder as dispatch)
+            let cfg_dir = root.join("config");
+            oc::write_reviewer_config(&cfg_dir).map_err(|e| e.to_string())?;
+            // the real CLI must load ONLY our config: no snapshot document
+            let out = oc::debug_config(exe, &cfg_dir, &root, &snapshot)
+                .map_err(|e| format!("debug config: {e}"))?;
+            oc::assert_boundary_holds(&out, cfg_dir.to_string_lossy().as_ref())
+        })();
+        let _ = version;
+        std::fs::remove_dir_all(&root).ok();
+        result
+    }
+
+    /// Convenience: just the body (most dispatch paths only need the digest).
+    pub fn assemble_handoff_body(
+        &self,
+        task: &Task,
+        step: &PlanStep,
+        generation: u64,
+        pending_answer: Option<(&str, &str)>,
+        relay_cp: Option<Checkpoint>,
+    ) -> Result<HandoffBody, CoreError> {
+        self.assemble_handoff(task, step, generation, pending_answer, relay_cp)
+            .map(|a| a.body)
+    }
+
+    /// U3 对照 baseline: bytes of a locally constructed comparison payload that
+    /// naively re-briefs the same task/candidate — the FULL diff, the whole
+    /// retained-change list, and the recent event timeline, with no role
+    /// filtering, no dedup, no budget. Clearly labeled as a comparison; it is
+    /// never sent to any runtime. Capped at 512 KiB for sanity.
+    pub fn comparison_payload_bytes(&self, task: &Task) -> usize {
+        let mut total = task.goal.as_bytes().len()
+            + task.acceptance.iter().map(|a| a.as_bytes().len() + 1).sum::<usize>();
+        if let Some(cand) = self.store.current_candidate(&task.task_id) {
+            total += cand
+                .changed_files
+                .iter()
+                .chain(cand.untracked_files.iter())
+                .map(|p| p.as_bytes().len() + 1)
+                .sum::<usize>();
+            if let Some(p) = &cand.patch_path {
+                total += std::fs::read(p).map(|b| b.len()).unwrap_or(0);
+            }
+        }
+        for e in self.store.list_task_events(&task.task_id, 400) {
+            total += e.kind.as_bytes().len() + serde_json::to_string(&e.payload).map(|s| s.len()).unwrap_or(0);
+        }
+        total.min(512 * 1024)
+    }
+
     // ================= attempt run loop (blocking) =================
 
     pub fn run_attempt_blocking(
@@ -1569,6 +2050,14 @@ failure_location: cp
             "claude" => Box::new(adapters::claude::ClaudeAdapter::new(
                 self.cfg.claude_exe.to_string_lossy().to_string(),
                 self.cfg.claude_version.clone().unwrap_or_default(),
+            )),
+            "opencode" => Box::new(adapters::opencode::OpencodeAdapter::new(
+                self.cfg.opencode_exe.clone(),
+                self.cfg.opencode_version.clone().unwrap_or_default(),
+            )),
+            "dsh" => Box::new(adapters::dsh::DshAdapter::new(
+                self.cfg.dsh.exe.clone(),
+                self.cfg.dsh.version.clone(),
             )),
             "fake" => Box::new(adapters::fake::FakeAdapter::new()),
             _ => {
@@ -1776,6 +2265,34 @@ failure_location: cp
             AttemptStatus::Completed
         };
         let _ = self.store.update_attempt(&attempt);
+        // H1/H2: a completed attempt with confirmed tree stop is real verification
+        // evidence for this adapter+version+role; the capability table records it.
+        // exit != 0 without a structured result never reaches this (Failed above) —
+        // "exit 0 或自由文本不等于验收通过" is enforced by the Completed gate below.
+        if attempt.status == AttemptStatus::Completed && res.exit.stop_confirmed {
+            let exe = self.probe_record(&attempt.adapter).executable;
+            let exe_sha = exe.as_deref().and_then(|p| exe_sha256(std::path::Path::new(p)));
+            crate::capability::note_real_loop(
+                &self.store,
+                &attempt.adapter,
+                &attempt.adapter_version,
+                exe.as_deref(),
+                exe_sha.as_deref(),
+                attempt.role.as_str(),
+            );
+            self.bus.emit(
+                Some(task_id),
+                Some(attempt_id),
+                attempt.generation,
+                "capability_verified",
+                json!({
+                    "adapter": attempt.adapter,
+                    "version": attempt.adapter_version,
+                    "role": attempt.role.as_str(),
+                    "evidence": crate::capability::EVID_REAL_LOOP,
+                }),
+            );
+        }
 
         // persist stderr as attempt log (bounded already) — WP16: scrub credential
         // values BEFORE the bytes reach disk, keeping the error class/location.
@@ -1962,7 +2479,7 @@ failure_location: cp
                                 });
                             if let Some(step) = reviewer_step.clone() {
                                 self.store.meta_set(&format!("next_step:{}", task_id), &step);
-                                if let Ok(rb) = self.assemble_handoff(
+                                if let Ok(rb) = self.assemble_handoff_body(
                                     &t,
                                     &PlanStep {
                                         step_id: step.clone(),
@@ -2293,7 +2810,7 @@ failure_location: cp
             })
             .ok_or_else(|| CoreError::conflict("plan_missing", "no approved plan"))?;
         let relay_cp = self.store.latest_checkpoint(&d.task_id);
-        let relay_body = self.assemble_handoff(
+        let relay_body = self.assemble_handoff_body(
             &task,
             &writer_step,
             relay_generation,
@@ -2473,7 +2990,7 @@ failure_location: cp
             .and_then(|p| p.steps.iter().find(|s| s.role == Role::Writer).cloned())
             .ok_or_else(|| CoreError::conflict("plan_missing", "no approved plan"))?;
         let relay_cp = self.checkpoint_view(&task);
-        let relay_body = self.assemble_handoff(&task, &writer_step, relay_generation, None, relay_cp.clone())?;
+        let relay_body = self.assemble_handoff_body(&task, &writer_step, relay_generation, None, relay_cp.clone())?;
         // persist the checkpoint view (the digest was verified against this content)
         if let Some(cp) = &relay_cp {
             if cp.checkpoint_id == "pending" {
@@ -2844,46 +3361,125 @@ fn normalize_repo(p: &str) -> String {
     p.trim_end_matches(['/', '\\']).replace('/', "\\")
 }
 
-fn fake_info() -> Value {
-    json!({
-        "id": "fake",
-        "version": "0.1.0",
-        "available": true,
-        "simulated": true,
-        "write_supported": true,
-        "read_only_supported": true,
-        "resume_supported": true,
-        "cancel_supported": true,
-        "probe_error": Value::Null,
-    })
+/// Legacy adapter rows derived from the H1 capability table (single semantics for
+/// doctor, /v1/adapters, web Tools page and the README matrix).
+impl Core {
+    pub fn adapters_json(&self) -> Vec<Value> {
+        self.capability_records()
+            .iter()
+            .map(|rec| {
+                let w = rec.role("writer");
+                let r = rec.role("reviewer");
+                json!({
+                    "id": rec.adapter,
+                    "version": rec.version,
+                    "available": rec.version.is_some() && rec.state != capability::STATE_NOT_INSTALLED,
+                    "simulated": rec.adapter == "fake",
+                    "write_supported": w.map(|x| x.verified && x.auto_route).unwrap_or(false),
+                    "read_only_supported": r.map(|x| x.verified && x.auto_route).unwrap_or(false),
+                    "resume_supported": rec.version.is_some() && rec.same_session_resume == "native_session",
+                    "cancel_supported": rec.stop_method.is_some(),
+                    "probe_error": rec.probe_error,
+                    "state": rec.state,
+                    "state_label_zh": rec.state_label("zh"),
+                    "state_label_en": rec.state_label("en"),
+                    "writer_experimental": w.map(|x| x.experimental).unwrap_or(false),
+                    "reviewer_experimental": r.map(|x| x.experimental).unwrap_or(false),
+                    "verified_version": rec.verified_version,
+                    "evidence": rec.evidence,
+                })
+            })
+            .collect()
+    }
 }
 
-fn codex_info(cfg: &CoreConfig) -> Value {
-    let ok = cfg.codex_exe.is_file() && cfg.codex_version.is_some();
-    json!({
-        "id": "codex",
-        "version": cfg.codex_version,
-        "available": ok,
-        "simulated": false,
-        "write_supported": ok,
-        "read_only_supported": ok,
-        "resume_supported": ok,
-        "cancel_supported": ok,
-        "probe_error": if ok { Value::Null } else { Value::String("codex CLI not found".into()) },
-    })
+/// WP26: the environment for OFFLINE probes — deliberately credential-free.
+/// Provider keys are whitelisted only into real model-run processes, never into
+/// probes; a fake/real key in the parent environment must not leak here.
+pub fn probe_env() -> Vec<(String, String)> {
+    let mut env = crate::runner::filter_env(&[]);
+    env.retain(|(k, _)| {
+        let ku = k.to_ascii_uppercase();
+        !(ku.contains("KEY") || ku.contains("TOKEN") || ku.contains("SECRET") || ku.contains("API"))
+    });
+    env
 }
 
-fn claude_info(cfg: &CoreConfig) -> Value {
-    let ok = cfg.claude_exe.is_file() && cfg.claude_version.is_some();
-    json!({
-        "id": "claude",
-        "version": cfg.claude_version,
-        "available": ok,
-        "simulated": false,
-        "write_supported": false,
-        "read_only_supported": ok,
-        "resume_supported": ok,
-        "cancel_supported": ok,
-        "probe_error": if ok { Value::Null } else { Value::String("claude CLI not found".into()) },
-    })
+/// WP26: content identity of the verified binary (streamed read; used at verify
+/// time and re-checked at every dispatch so a same-path replacement fails closed).
+pub fn exe_sha256(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total = 0usize;
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                total += n;
+                if total > 512 * 1024 * 1024 {
+                    return None; // absurd binary; refuse to bind
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+impl Core {
+    /// WP26: the per-dispatch authorization gate, extracted so tests exercise
+    /// the exact production logic. The role must still be routable (verification
+    /// may have been revoked since plan approval) and the binary content must
+    /// still match the verified identity (a same-path replacement fails closed).
+    /// Failure REVOKES the record: no stale authorization survives a failed check.
+    pub fn check_dispatch_authorization(
+        &self,
+        adapter: &str,
+        role: crate::model::Role,
+        exe_path: Option<&str>,
+    ) -> Result<(), CoreError> {
+        if adapter == "fake" {
+            return Ok(()); // in-process runtime: no binary identity to bind
+        }
+        let rec = self
+            .capability_records()
+            .into_iter()
+            .find(|r| r.adapter == adapter);
+        let role_str = match role {
+            crate::model::Role::Writer => "writer",
+            crate::model::Role::Reviewer => "reviewer",
+        };
+        let role_ok = rec.as_ref().map(|r| r.routable(role_str)).unwrap_or(false);
+        if !role_ok {
+            return Err(CoreError::conflict(
+                "capability_not_routable",
+                format!(
+                    "{adapter} no longer passes the {role_str} capability gate (verification revoked or missing); run wagglepost verify {adapter} and complete a real run to re-establish it"
+                ),
+            ));
+        }
+        if let Some(exe_path) = exe_path {
+            let live_sha = exe_sha256(std::path::Path::new(exe_path));
+            let ver = capability::load_verified(&self.store, adapter);
+            let bound_sha = ver.as_ref().and_then(|v| v.exe_sha256.clone());
+            let identity_ok = match (bound_sha, live_sha) {
+                (Some(b), Some(l)) => b == l,
+                _ => false,
+            };
+            if !identity_ok {
+                capability::revoke(&self.store, adapter, "binary identity changed at dispatch");
+                return Err(CoreError::conflict(
+                    "adapter_identity_drift",
+                    format!(
+                        "{adapter} verified binary no longer matches the record (replaced or unverifiable content); run wagglepost verify {adapter} to re-establish it"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }

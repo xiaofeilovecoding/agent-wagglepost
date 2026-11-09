@@ -2,7 +2,7 @@
 
 ## Supported version
 
-WagglePost 0.1.x on Windows 10/11 x64 is the tested platform. Unix builds are
+WagglePost 0.2.x on Windows 10/11 x64 is the tested platform. Unix builds are
 present in the source tree but are not supported or equated with the Windows
 acceptance.
 
@@ -25,7 +25,15 @@ the issue requires a local user, a browser session, or a malicious runtime.
 - Agent output is bounded and redacted before persistence/display; user code,
   patches and diffs are not rewritten.
 - Credentials for model runtimes stay with those native tools. WagglePost does
-  not read, print or persist model API keys.
+  not read, print or persist model API keys. The single documented exception is
+  the optional provider-key environment variable (e.g. `DEEPSEEK_API_KEY`), which
+  is read from the user's environment and forwarded only to the isolated runtime
+  process via its process environment — never to logs, receipts, the UI or Git.
+- External runtimes launch as argv arrays inside a Windows Job Object (assigned
+  before the first instruction). A reviewer runtime runs under a generated
+  per-attempt deny-list config (edit/shell/webfetch/subagent denied for
+  OpenCode); cancel/timeout require whole-tree exit confirmation before any
+  slot handover.
 - No telemetry.
 
 WagglePost is a local single-user tool, not a multi-tenant hosted service. Do

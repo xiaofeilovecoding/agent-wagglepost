@@ -1,6 +1,6 @@
 [package]
 name = "wagglepost"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "WagglePost: a local multi-agent router — dispatch tasks to native coding agents, review the same candidate with a second agent, and accept by version."
 license = "MIT"

@@ -14,31 +14,45 @@ const FLIGHT_KINDS: Record<string, 0 | 1 | 2> = {
 };
 
 // ---------- motion stage (static wires + independent motion layer) ----------
+// U2 唯一动效『送达』: triggered only by server-confirmed events; flights are
+// deduped by event seq + attempt + kind, same-direction bursts merge, opposite
+// direction waits at most one; hidden tabs clear without replay; reduced motion
+// never launches (status text and a brief aria-live note carry the meaning).
+// SMIL animateMotion keeps idle pages at zero rAF; the layer decouples from
+// SSE and control state.
+const FLIGHT_DUR_S = 0.65; // 合同: 约 500–750 ms
+
 function useMotion() {
   const layerRef = useRef<SVGGElement | null>(null);
   const timers = useRef<number[]>([]);
+  const currentRef = useRef<{ kind: 0 | 1 | 2; merged: number } | null>(null);
+  const pendingRef = useRef<{ kind: 0 | 1 | 2; merged: number } | null>(null);
+  const reduced = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const stop = useCallback(() => {
     timers.current.forEach((t) => window.clearTimeout(t));
     timers.current = [];
     if (layerRef.current) layerRef.current.replaceChildren();
+    currentRef.current = null;
+    pendingRef.current = null;
   }, []);
-  const play = useCallback(
-    (kind: 0 | 1 | 2, fromHub: boolean) => {
-      stop();
+  const launch = useCallback(
+    (kind: 0 | 1 | 2, merged: number) => {
       if (document.hidden) return;
-      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+      if (reduced()) return;
       const routes = [
-        { path: "M 98 64 C 166 64 226 21 310 55 C 392 87 447 17 522 43", color: "#36a7c3", dur: 1.24 },
-        { path: "M 522 43 C 447 17 392 87 310 55 C 382 85 449 114 522 83", color: "#e29c42", dur: 1.48 },
-        { path: "M 522 83 C 449 114 382 85 310 55 C 226 21 166 64 98 64", color: "#51bd98", dur: 1.24 },
+        { path: "M 98 64 C 166 64 226 21 310 55 C 392 87 447 17 522 43", color: "#36a7c3", dur: FLIGHT_DUR_S },
+        { path: "M 522 43 C 447 17 392 87 310 55 C 382 85 449 114 522 83", color: "#e29c42", dur: FLIGHT_DUR_S },
+        { path: "M 522 83 C 449 114 382 85 310 55 C 226 21 166 64 98 64", color: "#51bd98", dur: FLIGHT_DUR_S },
       ];
       const route = routes[kind];
       const NS = "http://www.w3.org/2000/svg";
       const layer = layerRef.current;
       if (!layer) return;
+      // one flight at a time: the motion layer starts empty
+      layer.replaceChildren();
       const launchers: (() => void)[] = [];
       for (let i = 5; i >= 0; i--) {
-        const delay = i * 0.043;
+        const delay = i * 0.03;
         const point = document.createElementNS(NS, "g");
         point.setAttribute("opacity", "0");
         if (i === 0) {
@@ -87,16 +101,51 @@ function useMotion() {
         });
       }
       launchers.forEach((l) => l());
-      const cleanup = window.setTimeout(() => stop(), (route.dur + 0.3) * 1000);
+      const cleanup = window.setTimeout(() => {
+        currentRef.current = null;
+        const p = pendingRef.current;
+        pendingRef.current = null;
+        if (p) {
+          currentRef.current = p;
+          launch(p.kind, p.merged);
+        } else {
+          // 空闲时运动节点清空 (SMIL frozen nodes are removed, no rAF either way)
+          if (layerRef.current) layerRef.current.replaceChildren();
+        }
+      }, (route.dur + 0.12) * 1000);
       timers.current.push(cleanup);
     },
     [stop]
+  );
+  const play = useCallback(
+    (kind: 0 | 1 | 2) => {
+      if (document.hidden) return;
+      if (reduced()) return;
+      const cur = currentRef.current;
+      if (cur) {
+        if (cur.kind === kind) {
+          // 快速同向合并: keep the in-flight bee, count the merged deliveries
+          cur.merged += 1;
+          return;
+        }
+        // 异向最多等待一个: newest replaces a queued opposite-direction flight
+        if (pendingRef.current?.kind !== kind) pendingRef.current = { kind, merged: 1 };
+        else pendingRef.current.merged += 1;
+        return;
+      }
+      currentRef.current = { kind, merged: 1 };
+      launch(kind, 1);
+    },
+    [launch]
   );
   useEffect(() => {
     const onHide = () => {
       if (document.hidden) stop();
     };
     document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("resize", () => {
+      if (reduced()) stop();
+    });
     return () => {
       document.removeEventListener("visibilitychange", onHide);
       stop();
@@ -110,6 +159,7 @@ function MotionStage({
   phase,
   caption,
   receipt,
+  merged,
   onPlay,
   layerRef,
 }: {
@@ -117,6 +167,7 @@ function MotionStage({
   phase: 0 | 1 | 2;
   caption: string;
   receipt: { label: string; short: string } | null;
+  merged?: number;
   onPlay: () => void;
   layerRef: React.RefObject<SVGGElement | null>;
 }) {
@@ -125,7 +176,10 @@ function MotionStage({
   return (
     <div className="motion-stage" data-phase={phase}>
       <div className="motion-bar">
-        <span aria-live="polite">{caption}</span>
+        <span aria-live="polite">
+          {caption}
+          {merged && merged > 1 ? (lang === "zh" ? ` · 合并 ${merged} 次` : ` · merged ×${merged}`) : ""}
+        </span>
         <button onClick={onPlay}>{t("playRoute", lang)}</button>
       </div>
       <svg viewBox="0 0 620 118" aria-hidden="true" focusable="false">
@@ -159,7 +213,252 @@ function MotionStage({
   );
 }
 
-// ---------- helpers ----------
+// ---------- U1 agent status bar ----------
+// 常驻紧凑状态条: one chip per runtime; buckets sorted 待你决定 → 执行中 →
+// 可接手 → 其他, stable within a bucket; click/Enter opens the in-workspace
+// detail (recent events, related tasks, roles), Escape returns focus to the
+// chip. Selection survives refreshes; hover never steals focus.
+const BUCKET_ORDER = ["decision", "running", "takable", "other"] as const;
+type Bucket = (typeof BUCKET_ORDER)[number];
+
+function bucketOf(status: string): Bucket {
+  if (["waiting_decision", "needs_input"].includes(status)) return "decision";
+  if (["starting", "running", "stopping"].includes(status)) return "running";
+  if (["needs_review", "queued"].includes(status)) return "takable";
+  return "other";
+}
+
+function StatusBar({
+  lang,
+  capabilities,
+  tasks,
+  lastAttempts,
+  inbox,
+  events,
+  selected,
+  onSelectTask,
+}: {
+  lang: Lang;
+  capabilities: any[];
+  tasks: Task[] | null;
+  lastAttempts: any[];
+  inbox: any[];
+  events: any[];
+  selected: string | null;
+  onSelectTask: (id: string) => void;
+}) {
+  const [openAgent, setOpenAgent] = useState<string | null>(null);
+  const chipRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const list = tasks || [];
+  const attemptOf: Record<string, any> = {};
+  for (const la of lastAttempts) attemptOf[la.task_id] = la;
+  const openInboxByTask: Record<string, any[]> = {};
+  for (const m of inbox) {
+    if (m.resolved) continue;
+    (openInboxByTask[m.task_id] ||= []).push(m);
+  }
+  // aggregate per adapter over non-terminal tasks
+  const perAgent: Record<string, { bucket: Bucket; tasks: any[]; decisions: number }> = {};
+  for (const task of list) {
+    if (task.status === "accepted" || task.status === "cancelled" || task.status === "failed") continue;
+    const adapter = attemptOf[task.task_id]?.adapter || "fake";
+    const entry = (perAgent[adapter] ||= { bucket: "other", tasks: [], decisions: 0 });
+    const b = bucketOf(task.status);
+    entry.tasks.push(task);
+    entry.decisions += (openInboxByTask[task.task_id] || []).filter((m: any) => m.kind === "decision_opened").length;
+    if (BUCKET_ORDER.indexOf(b) < BUCKET_ORDER.indexOf(entry.bucket)) entry.bucket = b;
+  }
+  const chips = capabilities.map((c: any) => {
+    const id = c.adapter;
+    const agg = perAgent[id];
+    // WP28: 空闲 may only show for a runtime that can actually take work right
+    // now (a verified, non-experimental role); not-installed/needs-config/probed/
+    // experimental runtimes keep their REAL capability label instead
+    const routable = (c.roles || []).some((r: any) => r.verified && r.auto_route && !r.experimental);
+    const experimental = (c.roles || []).some((r: any) => r.experimental);
+    return {
+      id,
+      state: c.state,
+      stateLabel: lang === "zh" ? c.state_label_zh : c.state_label_en,
+      simulated: id === "fake",
+      experimental,
+      routable,
+      bucket: agg?.bucket || null,
+      tasks: agg?.tasks || [],
+      decisions: agg?.decisions || 0,
+    };
+  });
+  chips.sort((a: any, b: any) => {
+    const ba = BUCKET_ORDER.indexOf(a.bucket || "other");
+    const bb = BUCKET_ORDER.indexOf(b.bucket || "other");
+    if (ba !== bb) return ba - bb;
+    return a.id < b.id ? -1 : 1; // 稳定排序同组
+  });
+  const open = chips.find((c: any) => c.id === openAgent);
+  return (
+    <div className="statusbar" role="region" aria-label={lang === "zh" ? "Agent 状态条" : "Agent status bar"}>
+      <div className="statusbar-row">
+        {chips.map((c: any) => {
+          const bucketLabel = c.bucket
+            ? lang === "zh"
+              ? { decision: "待你决定", running: "执行中", takable: "可接手", other: "其他" }[c.bucket as Bucket]
+              : { decision: "needs you", running: "running", takable: "ready", other: "other" }[c.bucket as Bucket]
+            : c.routable
+              ? lang === "zh"
+                ? "空闲"
+                : "idle"
+              : c.stateLabel; // WP28: 未安装/需配置/已探测/实验 keep their real state
+          const badge = c.bucket === "decision" && c.decisions > 0 ? c.decisions : c.tasks.length > 0 ? c.tasks.length : 0;
+          return (
+            <button
+              key={c.id}
+              ref={(el) => {
+                chipRefs.current[c.id] = el;
+              }}
+              className={"agentchip" + (openAgent === c.id ? " open" : "") + (c.bucket ? " b-" + c.bucket : "")}
+              data-agent={c.id}
+              aria-expanded={openAgent === c.id}
+              onClick={() => setOpenAgent(openAgent === c.id ? null : c.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setOpenAgent(openAgent === c.id ? null : c.id);
+                }
+                if (e.key === "Escape") {
+                  setOpenAgent(null);
+                  chipRefs.current[c.id]?.focus();
+                }
+              }}
+            >
+              <span className={"agentdot d-" + (c.bucket || "idle")} aria-hidden="true" />
+              <span className="agentname">{c.id}</span>
+              <span className="agentstate">
+                {bucketLabel}
+                {c.experimental ? (lang === "zh" ? " · 实验" : " · exp") : ""}
+              </span>
+              {badge > 0 && <span className="agentbadge">{badge}</span>}
+            </button>
+          );
+        })}
+      </div>
+      {open && (
+        <div className="agentdetail" role="group" aria-label={open.id}>
+          <p className="muted">
+            {open.stateLabel}
+            {(open.tasks.length || 0) > 0
+              ? lang === "zh"
+                ? ` · ${open.tasks.length} 个进行中任务`
+                : ` · ${open.tasks.length} active task(s)`
+              : lang === "zh"
+                ? " · 无进行中任务"
+                : " · no active tasks"}
+            {open.experimental ? (lang === "zh" ? " · 该运行时角色无法原生限制，仅实验/检测，不进入自动路由" : " · roles cannot be natively restricted; experimental/detection only, never auto-routed") : ""}
+          </p>
+          {open.tasks.length === 0 && events.filter((e: any) => false).length === 0 && (
+            <p className="muted">{lang === "zh" ? "最近无相关事件。" : "No recent events."}</p>
+          )}
+          {open.tasks.map((task: any) => {
+            const la = attemptOf[task.task_id] || {};
+            const role = la.role === "writer" ? (lang === "zh" ? "写入" : "writer") : lang === "zh" ? "复核" : "reviewer";
+            return (
+              <div key={task.task_id} className="agenttask">
+                <button
+                  className="linkbtn"
+                  onClick={() => {
+                    onSelectTask(task.task_id);
+                    setOpenAgent(null);
+                  }}
+                >
+                  {task.title}
+                </button>
+                <span className="tag">{statusText(task.status, lang)}</span>
+                <span className="muted">{lang === "zh" ? `角色 ${role}` : `role ${role}`}</span>
+                {(openInboxByTask[task.task_id] || []).map((m: any) => (
+                  <p key={m.message_id} className="muted" style={{ fontSize: 12 }}>
+                    {m.kind === "decision_opened"
+                      ? lang === "zh"
+                        ? "待你回答决策卡"
+                        : "decision card waiting"
+                      : m.kind === "blocked"
+                        ? `${lang === "zh" ? "阻塞" : "blocked"}: ${JSON.stringify(m.payload).slice(0, 80)}`
+                        : m.kind}
+                  </p>
+                ))}
+              </div>
+            );
+          })}
+          <p className="muted" style={{ fontSize: 12 }}>
+            {lang === "zh"
+              ? "详情只覆盖蜂递任务，不读取全机会话。"
+              : "Covers wagglepost tasks only; machine-wide sessions are never read."}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- U3 交接账单 ----------
+function BillPanel({ lang, bill, identity }: { lang: Lang; bill: any; identity: any }) {
+  if (!bill) return null;
+  const reason = (r: string | null) => {
+    if (!r) return "";
+    const zh: Record<string, string> = {
+      empty: "空，未包含",
+      over_budget_trimmed: "超预算裁剪",
+      over_budget_dropped: "超预算未发送",
+    };
+    const en: Record<string, string> = {
+      empty: "empty; not included",
+      over_budget_trimmed: "trimmed over budget",
+      over_budget_dropped: "dropped over budget",
+    };
+    return lang === "zh" ? zh[r] || r : en[r] || r;
+  };
+  return (
+    <div className="handoff-bill" data-testid="handoff-bill">
+      <p className="bill-head">
+        <strong>{lang === "zh" ? "将发送的范围" : "Scope to be sent"}</strong>{" "}
+        {bill.bytes} {t("bytes", lang)} · {lang === "zh" ? "预算" : "budget"} {bill.budget_bytes} · digest{" "}
+        <code>{String(bill.sha256).slice(0, 10)}</code>
+        {bill.truncated ? <span className="tag warn">{lang === "zh" ? "已裁剪" : "trimmed"}</span> : null}
+      </p>
+      <ul className="bill-list">
+        {(bill.included || []).map((s: any) => (
+          <li key={"i" + s.title}>
+            <span className="tag">{lang === "zh" ? "含" : "incl"}</span> {s.title} · {s.bytes} {t("bytes", lang)}
+            {s.reason ? <em className="muted"> ({reason(s.reason)})</em> : null}
+          </li>
+        ))}
+        {(bill.excluded || []).map((s: any) => (
+          <li key={"e" + s.title} className="muted">
+            <span className="tag">{lang === "zh" ? "排" : "excl"}</span> {s.title} — {reason(s.reason)}
+          </li>
+        ))}
+      </ul>
+      <p className="muted" style={{ fontSize: 12 }}>
+        {lang === "zh" ? "汇报契约" : "reporting contract"} {bill.footer_bytes} {t("bytes", lang)} ·{" "}
+        {lang === "zh" ? "模式" : "mode"} {bill.mode}
+        {identity
+          ? ` · ${lang === "zh" ? "工作树" : "worktree"} ${identity.worktree_id ? String(identity.worktree_id).slice(0, 8) : "—"} · ${lang === "zh" ? "候选" : "candidate"} ${identity.candidate_short || "—"} · rev ${identity.task_revision} · gen ${identity.generation}`
+          : ""}
+      </p>
+      {bill.comparison_bytes != null && (
+        <p className="muted" style={{ fontSize: 12 }}>
+          {lang === "zh" ? "对照" : "Comparison"}: {lang === "zh" ? "本地构造的全量重讲载荷约" : "locally constructed naive re-brief payload ≈"}{" "}
+          {bill.comparison_bytes} {t("bytes", lang)}
+          {lang === "zh" ? "（仅对照，不发送）。" : " (reference only, never sent)."}
+        </p>
+      )}
+      <p className="muted" style={{ fontSize: 12 }}>
+        {lang === "zh"
+          ? "digest 绑定本次实际发出的正文；任务身份或候选变化后需重新预览确认。"
+          : "The digest binds this exact body; identity or candidate changes require a fresh preview."}
+      </p>
+    </div>
+  );
+}
+
 function useSse(onEvent: (ev: any) => void) {
   const cbRef = useRef(onEvent);
   cbRef.current = onEvent;
@@ -230,9 +529,17 @@ function App() {
   const [route, setRoute] = useState<any>(null);
   const [receipt, setReceipt] = useState<{ label: string; short: string } | null>(null);
   const [flightPhase, setFlightPhase] = useState<0 | 1 | 2>(0);
+  const [flightMerged, setFlightMerged] = useState(1);
+  const [lastAttempts, setLastAttempts] = useState<any[]>([]);
+  const [barAgent, setBarAgent] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [decisionChoice, setDecisionChoice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // latest-value mirrors for the SSE handler (no re-render coupling)
+  const receiptRef = useRef<{ label: string; short: string } | null>(null);
+  const flightPhaseRef = useRef<0 | 1 | 2>(0);
+  receiptRef.current = receipt;
+  flightPhaseRef.current = flightPhase;
   const { layerRef, play, stop } = useMotion();
 
   useEffect(() => {
@@ -251,6 +558,7 @@ function App() {
     try {
       const r = await api.tasks();
       setTasks(r.tasks);
+      setLastAttempts(r.last_attempts || []);
       setInbox((r.inbox || []).filter((m: any) => !m.resolved));
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) setAuthed(false);
@@ -311,7 +619,9 @@ function App() {
     [lang, refreshTask, stop]
   );
 
-  // SSE: refresh + real-event flight (dedupe by seq handled in useSse)
+  // SSE: refresh + real-event flight. Dedupe: seq (useSse) + attempt+kind; the
+  // departure/receipt kinds arrive once per real server confirmation, so replays
+  // (reconnect history, resync) never re-fly: the resync handler refetches only.
   useSse((ev) => {
     if (ev.kind === "resync") {
       // replay window/lagged stream: refetch the authoritative snapshot instead
@@ -324,10 +634,17 @@ function App() {
       refreshTask(ev.task_id);
       const kind = FLIGHT_KINDS[ev.kind];
       if (kind !== undefined) {
+        // U2: stale-result guard — a second receipt for the same candidate never
+        // re-flies; the static stamp just updates
+        const short = ev.payload?.candidate || ev.payload?.review;
+        const isStaleReceipt =
+          ev.kind === "result_collected" && receiptRef.current?.short === String(short || "").slice(0, 7);
         setFlightPhase(kind);
-        play(kind, true);
+        if (!isStaleReceipt) {
+          setFlightMerged((m) => (flightPhaseRef.current === kind ? m + 1 : 1));
+          play(kind);
+        }
         if (ev.kind === "result_collected") {
-          const short = ev.payload?.candidate || ev.payload?.review;
           if (short) setReceipt({ label: t("collected", lang), short: String(short).slice(0, 7) });
         }
         if (ev.kind === "attempt_started" || ev.kind === "reroute_started") {
@@ -384,7 +701,7 @@ function App() {
           <div className="row">
             <strong>wagglepost</strong>
             <span className="muted">/</span>
-            <code>v{("0.1.0")}</code>
+            <code>v{("0.2.0")}</code>
           </div>
           <div className="top-controls">
             <button
@@ -413,6 +730,18 @@ function App() {
             <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="toggle theme">◐</button>
           </div>
         </header>
+        {nav === "desk" && (
+          <StatusBar
+            lang={lang}
+            capabilities={doctor?.capabilities || []}
+            tasks={tasks}
+            lastAttempts={lastAttempts}
+            inbox={inbox}
+            events={[]}
+            selected={selected}
+            onSelectTask={selectTask}
+          />
+        )}
         <div className="content">
           {nav === "desk" && (selected === "__new__" ? (
             <NewTask
@@ -432,13 +761,10 @@ function App() {
               route={route}
               receipt={receipt}
               flightPhase={flightPhase}
+              flightMerged={flightMerged}
               layerRef={layerRef}
               onPlay={() => {
-                const kind = flightPhase;
-                if (kind === 2 && !receipt) {
-                  // static feedback under reduced motion
-                }
-                play(kind, true);
+                play(flightPhase);
               }}
               decisionChoice={decisionChoice}
               setDecisionChoice={setDecisionChoice}
@@ -595,7 +921,8 @@ function NewTask({ lang, onDone }: { lang: Lang; onDone: (id: string) => void })
   const [goal, setGoal] = useState("");
   const [repo, setRepo] = useState("");
   const [recipe, setRecipe] = useState("write_then_review");
-  const [adapters, setAdapters] = useState("codex, claude");
+  // empty = all registered runtimes; the capability table filters unqualified ones
+  const [adapters, setAdapters] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   return (
@@ -621,8 +948,8 @@ function NewTask({ lang, onDone }: { lang: Lang; onDone: (id: string) => void })
           </select>
         </label>
         <label>
-          {lang === "zh" ? "允许的运行时（逗号分隔）" : "Allowed runtimes (comma separated)"}
-          <input value={adapters} onChange={(e) => setAdapters(e.target.value)} />
+          {lang === "zh" ? "允许的运行时（逗号分隔，留空=全部）" : "Allowed runtimes (comma separated; empty = all)"}
+          <input value={adapters} onChange={(e) => setAdapters(e.target.value)} placeholder="codex, claude, opencode, dsh…" />
         </label>
         {err && <p className="muted" role="alert">{err}</p>}
         <button
@@ -667,6 +994,7 @@ function TaskView({
   route,
   receipt,
   flightPhase,
+  flightMerged,
   layerRef,
   onPlay,
   decisionChoice,
@@ -679,8 +1007,8 @@ function TaskView({
   selectTask,
   onReceipt,
 }: any) {
-  const [resumePreview, setResumePreview] = useState<{ digest: string; text: string; bytes: number; decisionId: string; optionId: string } | null>(null);
-  const [approvalPreview, setApprovalPreview] = useState<{ digest: string; text: string; bytes: number; revision: number } | null>(null);
+  const [resumePreview, setResumePreview] = useState<any>(null);
+  const [approvalPreview, setApprovalPreview] = useState<any>(null);
   const [handoff, setHandoff] = useState<any>(null);
   const [diff, setDiff] = useState<any>(null);
   const [showDiff, setShowDiff] = useState(false);
@@ -735,6 +1063,14 @@ function TaskView({
   const primary = async () => {
     setBusy(true);
     try {
+      if (status === "awaiting_approval" && !snap.plan) {
+        // manual flow: build the local route first (zero model calls), then the
+        // same two-step approval as every other task
+        await api.plan(task.task_id);
+        await refreshTask(task.task_id);
+        setBusy(false);
+        return;
+      }
       if (status === "awaiting_approval" && snap.plan) {
         // WP15 two-step: first click fetches and shows the exact first-run body;
         // only the confirm click sends its digest + the current revision.
@@ -745,6 +1081,8 @@ function TaskView({
             text: prev.handoff.text,
             bytes: prev.handoff.bytes,
             revision: task.revision,
+            bill: prev.bill,
+            identity: prev.identity,
           });
           setBusy(false);
           return;
@@ -767,6 +1105,8 @@ function TaskView({
             bytes: prev.handoff.bytes,
             decisionId: decision.decision_id,
             optionId: decisionChoice,
+            bill: prev.bill,
+            identity: prev.identity,
           });
           setBusy(false);
           return;
@@ -799,6 +1139,9 @@ function TaskView({
   };
 
   const primaryLabel = (() => {
+    if (status === "awaiting_approval" && !snap.plan) {
+      return lang === "zh" ? "生成路线" : "Build route";
+    }
     if (status === "awaiting_approval") {
       return approvalPreview && approvalPreview.revision === task.revision
         ? (lang === "zh" ? "确认发送此正文" : "Confirm this body")
@@ -856,7 +1199,7 @@ function TaskView({
               {simulated ? ` · ${t("simulated", lang)}` : ""}
             </p>
           </div>
-          <MotionStage lang={lang} phase={phase} caption={caption} receipt={derivedReceipt} onPlay={onPlay} layerRef={layerRef} />
+          <MotionStage lang={lang} phase={phase} caption={caption} receipt={derivedReceipt} merged={flightMerged} onPlay={onPlay} layerRef={layerRef} />
           <div className="lineup" id="lineup">
             {(snap.plan?.steps || []).map((s: any, i: number) => {
               const st = attempts.find((a: any) => a.step_id === s.step_id);
@@ -929,6 +1272,7 @@ function TaskView({
               <summary>
                 {lang === "zh" ? "待发送正文预览" : "Body to be sent"} — {resumePreview.bytes} {t("bytes", lang)}
               </summary>
+              <BillPanel lang={lang} bill={resumePreview.bill} identity={resumePreview.identity} />
               <div className="diffbox">{resumePreview.text}</div>
               <p className="muted" style={{ fontSize: 12 }}>
                 digest: <code>{resumePreview.digest}</code>
@@ -967,6 +1311,7 @@ function TaskView({
               <summary>
                 {lang === "zh" ? "待批准正文预览" : "Body awaiting approval"} — {approvalPreview.bytes} {t("bytes", lang)}
               </summary>
+              <BillPanel lang={lang} bill={approvalPreview.bill} identity={approvalPreview.identity} />
               <div className="diffbox">{approvalPreview.text}</div>
               <p className="muted" style={{ fontSize: 12 }}>
                 revision: <code>{approvalPreview.revision}</code> · digest: <code>{approvalPreview.digest}</code>
@@ -1068,7 +1413,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
   }, [task.task_id]);
   const cp = (snap.checkpoints || [])[0];
   const eligible = targets.filter((c) => c.ok && !c.simulated);
-  const gateBlocked = targets.filter((c) => !c.ok && ["version_unavailable", "permission_insufficient", "role_write_not_supported"].some((rc) => (c.reasons || []).some((r: any) => r.reason_code === rc)));
+  const gateBlocked = targets.filter((c) => !c.ok && ["version_unavailable", "permission_insufficient", "role_write_not_supported", "capability_unverified", "capability_experimental"].some((rc) => (c.reasons || []).some((r: any) => r.reason_code === rc)));
   return (
     <div className="reasons">
       <p>
@@ -1093,6 +1438,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
           <summary>
             {t("sendBody", lang)} — {handoff.handoff.bytes} {t("bytes", lang)}
           </summary>
+          <BillPanel lang={lang} bill={handoff.bill} identity={handoff.identity} />
           <div className="diffbox">{handoff.handoff.text}</div>
         </details>
       )}
@@ -1156,27 +1502,49 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
 
 // ---------- tools ----------
 function Tools({ lang, doctor, onBack }: { lang: Lang; doctor: any; onBack: () => void }) {
-  const adapters = doctor?.adapters || [];
+  const adapters = doctor?.capabilities || [];
+  const stateCls = (st: string) => " cap-" + (st || "unknown").replace(/_/g, "-");
   return (
     <section className="panel">
       <div className="panel-head">
         <h2>{t("runtimeCaps", lang)}</h2>
-        <p>{lang === "zh" ? "doctor 探测的本机能力；未过门槛的能力如实显示。" : "On-device capabilities from doctor; unpassed gates are shown honestly."}</p>
+        <p>
+          {lang === "zh"
+            ? "能力五档：未安装 → 需配置 → 已探测 → 验证通过 → 不支持。验证绑定精确版本；跑一次真实任务自动升级。"
+            : "Five-state ladder: not installed → needs setup → probed → verified → unsupported. Verification binds the exact version; one real run upgrades it."}
+        </p>
       </div>
       <div className="lineup tasklist">
-        {adapters.map((a: any) => (
-          <div key={a.id} className="taskrow" style={{ cursor: "default" }}>
+        {adapters.map((c: any) => (
+          <div key={c.adapter} className="taskrow" style={{ cursor: "default" }}>
             <span>
               <span className="t-title">
-                {a.id} {a.simulated ? `(${t("simulated", lang)})` : ""} <code>{a.version || "—"}</code>
+                {c.adapter} {c.adapter === "fake" ? `(${t("simulated", lang)})` : ""} <code>{c.version || "—"}</code>
+                <span className={"tag" + stateCls(c.state)}>{lang === "zh" ? c.state_label_zh : c.state_label_en}</span>
               </span>
-              <small>{a.probe_error || (lang === "zh" ? "可用" : "available")}</small>
+              <small>
+                {c.probe_error || (lang === "zh" ? "入口与版本可观测" : "entry and version observable")}
+                {c.verified_version
+                  ? ` · ${lang === "zh" ? "验证绑定" : "verified"}: ${c.verified_version} (${c.evidence})`
+                  : ""}
+              </small>
+              {(c.roles || []).map((r: any) => (
+                <small key={r.role} style={{ display: "block" }}>
+                  {r.role === "writer" ? t("writerRole", lang) : t("reviewRole", lang)}:{" "}
+                  {r.verified
+                    ? lang === "zh" ? "已验证" : "verified"
+                    : r.experimental
+                      ? lang === "zh" ? "实验/仅检测（无原生限制）" : "experimental (no native restriction)"
+                      : lang === "zh" ? "未验证" : "unverified"}
+                  {r.permission_boundary ? ` · ${r.permission_boundary}` : ""}
+                </small>
+              ))}
             </span>
             <span className="row">
-              <span className={a.write_supported ? "tag" : "tag"} style={{ opacity: a.write_supported ? 1 : 0.45 }}>{t("write", lang)}</span>
-              <span className="tag" style={{ opacity: a.read_only_supported ? 1 : 0.45 }}>{t("readOnly", lang)}</span>
-              <span className="tag" style={{ opacity: a.resume_supported ? 1 : 0.45 }}>{t("resume", lang)}</span>
-              <span className="tag" style={{ opacity: a.cancel_supported ? 1 : 0.45 }}>{t("cancel", lang)}</span>
+              <span className="tag" style={{ opacity: c.roles?.some((r: any) => r.role === "writer" && r.verified && r.auto_route) ? 1 : 0.45 }}>{t("write", lang)}</span>
+              <span className="tag" style={{ opacity: c.roles?.some((r: any) => r.role === "reviewer" && r.verified && r.auto_route) ? 1 : 0.45 }}>{t("readOnly", lang)}</span>
+              <span className="tag" style={{ opacity: c.same_session_resume === "native_session" ? 1 : 0.45 }}>{t("resume", lang)}</span>
+              <span className="tag" style={{ opacity: c.stop_method ? 1 : 0.45 }}>{t("cancel", lang)}</span>
             </span>
           </div>
         ))}

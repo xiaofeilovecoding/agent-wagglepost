@@ -61,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/session", post(create_session))
         .route("/v1/session/csrf", get(get_csrf))
         .route("/v1/adapters", get(adapters))
+        .route("/v1/adapters/{id}/verify", post(verify_adapter))
         .route("/v1/doctor", get(doctor))
         .route("/v1/requests/{id}", get(get_request))
         .route("/v1/tasks", post(create_task).get(list_tasks))
@@ -330,6 +331,23 @@ async fn doctor(State(state): State<SharedState>, headers: HeaderMap) -> Respons
     Json(state.core.doctor()).into_response()
 }
 
+/// H1/H2: offline no-account contract verification (version-bound record).
+async fn verify_adapter(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> Response {
+    let (bearer, cookie) = auth_context(&state, &headers);
+    if let Err(r) = guard(&state, &Method::POST, &headers, cookie, bearer).await {
+        return r;
+    }
+    match state.core.verify_adapter(&id) {
+        Ok(rec) => Json(json!({"capability": rec.to_json()})).into_response(),
+        Err(e) => core_error_response(&e),
+    }
+}
+
 async fn list_tasks(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let (bearer, cookie) = auth_context(&state, &headers);
     if let Err(r) = guard(&state, &Method::GET, &headers, cookie, bearer).await {
@@ -342,7 +360,31 @@ async fn list_tasks(State(state): State<SharedState>, headers: HeaderMap) -> Res
         let visible: HashSet<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
         inbox.retain(|m| visible.contains(&m.task_id));
     }
-    Json(json!({"tasks": tasks, "inbox": inbox})).into_response()
+    // U1 agent status bar: per-task latest attempt (adapter/role/status/generation)
+    // so the UI can aggregate per-agent state without fetching every snapshot
+    let rows: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            let last = state
+                .core
+                .store
+                .list_attempts(&t.task_id)
+                .into_iter()
+                .max_by_key(|a| a.launch_no);
+            match last {
+                Some(a) => json!({
+                    "task_id": t.task_id,
+                    "adapter": a.adapter,
+                    "role": a.role.as_str(),
+                    "attempt_status": a.status.as_str(),
+                    "generation": a.generation,
+                    "simulated": a.simulated,
+                }),
+                None => json!({"task_id": t.task_id}),
+            }
+        })
+        .collect();
+    Json(json!({"tasks": tasks, "inbox": inbox, "last_attempts": rows})).into_response()
 }
 
 async fn create_task(
@@ -977,15 +1019,44 @@ async fn handoff_preview(
         None
     };
     match state.core.assemble_handoff(&task, step, generation, pending, relay_cp) {
-        Ok(h) => Json(json!({
-            "handoff": {
-                "text": h.text, "bytes": h.bytes, "sha256": h.sha256,
-                "mode": h.mode, "budget_bytes": h.budget_bytes,
-                "evidence_refs": h.evidence_refs,
-            },
-            "approved_digest": sha256_hex(h.text.as_bytes()),
-        }))
-        .into_response(),
+        Ok(assembled) => {
+            let h = &assembled.body;
+            // U3 交接账单: identity the confirmation binds — the managed worktree of
+            // the step's generation (relay generations reuse the checkpoint view)
+            // and the current candidate short id.
+            let worktree_id = state
+                .core
+                .store
+                .list_task_worktrees(&id)
+                .into_iter()
+                .find(|w| w.generation == task.current_generation)
+                .map(|w| w.worktree_id);
+            let candidate_short = state
+                .core
+                .store
+                .current_candidate(&id)
+                .map(|c| c.candidate_hash[..8.min(c.candidate_hash.len())].to_string());
+            let mut bill = assembled.bill.clone();
+            // U3 对照: locally constructed comparison payload (everything a naive
+            // re-brief would carry) — labeled as comparison, never sent.
+            bill.comparison_bytes = Some(state.core.comparison_payload_bytes(&task));
+            Json(json!({
+                "handoff": {
+                    "text": h.text, "bytes": h.bytes, "sha256": h.sha256,
+                    "mode": h.mode, "budget_bytes": h.budget_bytes,
+                    "evidence_refs": h.evidence_refs,
+                },
+                "approved_digest": sha256_hex(h.text.as_bytes()),
+                "bill": bill,
+                "identity": {
+                    "worktree_id": worktree_id,
+                    "candidate_short": candidate_short,
+                    "task_revision": task.revision,
+                    "generation": generation,
+                },
+            }))
+            .into_response()
+        }
         Err(e) => core_error_response(&e),
     }
 }

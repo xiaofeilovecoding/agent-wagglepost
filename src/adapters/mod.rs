@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod dsh;
 pub mod fake;
+pub mod opencode;
 
 use crate::model::*;
 use crate::runner::{ExitOutcome, RunningChild, SpawnSpec};
