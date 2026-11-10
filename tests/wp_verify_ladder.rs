@@ -128,13 +128,12 @@ fn wp22_version_or_binary_drift_degrades_even_after_verify() {
 
 #[test]
 fn wp22_real_loop_requires_same_binary_and_version() {
-    let env = TestEnv::new();
+    let env = opencode_env("");
     // a real loop on (version A, path P, sha S) authorizes only that identity
     let rec0 = env.core.probe_record("opencode");
-    let version = rec0.version.clone().unwrap_or_default();
-    assert!(!version.is_empty(), "the fixture host must have opencode discoverable for this test");
+    let version = rec0.version.expect("the OpenCode fixture provides a version");
     let sha = "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8";
-    let path = rec0.executable.clone().unwrap_or_default();
+    let path = rec0.executable.expect("the OpenCode fixture provides an executable");
     wagglepost::capability::note_real_loop(&env.core.store, "opencode", &version, Some(&path), Some(sha), "reviewer");
     // WP26 gate: same path but DIFFERENT content hash → refused + revoked
     let err = env
