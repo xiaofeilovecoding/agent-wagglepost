@@ -188,7 +188,7 @@ fn cap_route_preview_names_capability_gaps() {
 fn cap_experimental_runtime_never_auto_routes_even_after_real_run() {
     // dsh completes a real loop? not in this fixture — but the gate is structural:
     // note_real_loop preserves the experimental mark from the probe record.
-    let env = TestEnv::new();
+    let env = injected_env();
     // simulate what a real dsh run would write for its version
     let rec = env.core.probe_record("dsh");
     let exe_sha = rec.executable.as_deref().and_then(|p| wagglepost::core::exe_sha256(std::path::Path::new(p)));
