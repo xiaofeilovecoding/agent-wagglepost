@@ -533,7 +533,7 @@ Sample repository for the offline wagglepost tour.
                             role: "reviewer",
                             supported: true,
                             boundary: Some(
-                                "opencode managed-snapshot cwd (candidate configs stripped) + global deny edit/shell/webfetch/subagent/external_directory, proven by the debug-config rule probe",
+                                "OpenCode isolated snapshot and homes, default deny except read/glob/grep, with exact-policy preflight",
                             ),
                         },
                     ],
@@ -1977,11 +1977,8 @@ failure_location: cp
             }
             // managed deny config (same builder as dispatch)
             let cfg_dir = root.join("config");
-            oc::write_reviewer_config(&cfg_dir).map_err(|e| e.to_string())?;
-            // the real CLI must load ONLY our config: no snapshot document
-            let out = oc::debug_config(exe, &cfg_dir, &root, &snapshot)
-                .map_err(|e| format!("debug config: {e}"))?;
-            oc::assert_boundary_holds(&out, cfg_dir.to_string_lossy().as_ref())
+            oc::write_reviewer_config(&cfg_dir)?;
+            oc::preflight_effective_config(exe, &cfg_dir, &root, &snapshot)
         })();
         let _ = version;
         std::fs::remove_dir_all(&root).ok();
@@ -2054,6 +2051,7 @@ failure_location: cp
             "opencode" => Box::new(adapters::opencode::OpencodeAdapter::new(
                 self.cfg.opencode_exe.clone(),
                 self.cfg.opencode_version.clone().unwrap_or_default(),
+                None,
             )),
             "dsh" => Box::new(adapters::dsh::DshAdapter::new(
                 self.cfg.dsh.exe.clone(),

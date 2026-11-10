@@ -35,11 +35,11 @@ Sample tasks always run on the `fake` simulated runtime and are clearly labeled 
 
 ## Real capability matrix (same semantics as `wagglepost doctor` / the Tools page)
 
-Capabilities live on a five-state ladder: **not installed → needs setup → probed → verified → unsupported**. Verification binds to an exact version AND binary path — a version or path change, a probe timeout or a nonzero probe exit invalidates it (fail closed); help flags are probe-only and never open a role; the next real run upgrades the evidence. The table below is the 0.2 dev-machine acceptance baseline (v0.2.0, 2026-11-10):
+Capabilities live on a five-state ladder: **not installed → needs setup → probed → verified → unsupported**. Verification binds to an exact version, binary path, and executable SHA-256 — a version or path change, a probe timeout or a nonzero probe exit invalidates it (fail closed); help flags are probe-only and never open a role; the next real run upgrades the evidence. The table below is the 0.2 dev-machine acceptance baseline (v0.2.0, 2026-11-10):
 
 | Runtime | Writer | Reviewer | State and evidence |
 | --- | --- | --- | --- |
-| OpenCode v2.2.6 | — (experimental) | ✅ Verified (offline rule probe + real_loop) | Official standalone zip, pinned install; `run --standalone --format json` structured events; the reviewer runs in a MANAGED SNAPSHOT (candidate-supplied opencode configs/instruction files stripped on copy, symlinks skipped) with global deny edit/shell/webfetch/subagent/external_directory; `wagglepost verify` proves via the real CLI's debug-config rule probe (no model) that candidate configs cannot override; completed a REAL model review through wagglepost dispatch and was accepted |
+| OpenCode v2.2.6 | — (experimental) | ✅ Verified (offline rule probe + real_loop) | Official standalone zip, pinned install; `run --standalone --format json` structured events; the reviewer runs in a MANAGED SNAPSHOT (candidate-supplied opencode configs/instruction files stripped on copy, symlinks skipped) with an isolated home and a default-deny policy allowing only read, glob, and grep. Project configuration is disabled. Each launch checks the exact policy and its sources before passing credentials. A real review through WagglePost was demonstrated during development |
 | DeepSeek Harness (DSH) 0.2.1-rc.5 | — (experimental) | — (experimental) | `headless --json` transport contract verified (NDJSON events, vendor usage); the headless profile exposes no native permission restriction, so both roles stay experimental and never auto-route (the `--session-id` resume is unverified and not claimed) |
 | Claude Code 2.1.278 | — | Probed | `--disallowedTools`+`--strict-mcp-config` is a provable boundary; not run in this batch, stays probed |
 | Codex CLI | Not installed | Not installed | No entry on this machine; the `--sandbox` contract is checkable in help; after installing, `wagglepost verify codex` writes the verification record |
@@ -55,7 +55,7 @@ Notes:
 
 | Runtime | Discovery | Configuration needed |
 | --- | --- | --- |
-| OpenCode | `WAGGLEPOST_OPENCODE_EXE`, `PATH`, or a pinned `D:\dev\tools\opencode-*` dir | `DEEPSEEK_API_KEY` (env var, whitelist-forwarded to the isolated process only) or `WAGGLEPOST_OPENCODE_MODEL=provider/model` |
+| OpenCode | `WAGGLEPOST_OPENCODE_EXE`, `PATH`, or a pinned `D:\dev\tools\opencode-*` dir | `DEEPSEEK_API_KEY` (env var, whitelist-forwarded to the isolated process only) or `WAGGLEPOST_OPENCODE_MODEL=provider/model` Use the DeepSeek key via the environment. The optional model selector changes the model ID only. The isolated process does not load personal OpenCode sign-ins. |
 | DSH | `WAGGLEPOST_DSH_EXE`, `PATH` (the desktop bundle's `dsh.cmd` is found directly) | Its own login; roles stay experimental, no auto-routing |
 | Codex | `WAGGLEPOST_CODEX_EXE`, `PATH` | Its own login |
 | Claude Code | `WAGGLEPOST_CLAUDE_EXE`, `PATH` (npm shims resolve to the real exe) | Its own login |

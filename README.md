@@ -39,7 +39,7 @@ cargo build --locked --release
 
 | 运行时 | 写者 | 复核者 | 状态与证据 |
 | --- | --- | --- | --- |
-| OpenCode v2.2.6 | —（实验/仅检测） | ✅ 验证通过（offline 规则探针 + real_loop） | 官方 standalone zip 固定版安装；`run --standalone --format json` 结构化事件；复核者运行在受管快照（候选自带的 opencode 配置/指令文件复制时剥除、符号链接跳过），全局 deny edit/shell/webfetch/subagent/external_directory；`wagglepost verify` 用真实 CLI 的 debug-config 规则探针（无模型）证明候选配置无法覆盖；经蜂递调度完成真实模型复核并接收 |
+| OpenCode v2.2.6 | —（实验/仅检测） | ✅ 验证通过（offline 规则探针 + real_loop） | 官方 standalone zip 固定版安装；`run --standalone --format json` 结构化事件；复核者运行在受管快照（候选自带的 opencode 配置/指令文件复制时剥除、符号链接跳过），使用隔离用户目录，权限默认拒绝，仅允许 read、glob、grep。禁用项目配置，每次启动先离线核对完整策略及来源，再传递凭据。开发期间已通过蜂递调度实测真实模型复核 |
 | DeepSeek Harness (DSH) 0.2.1-rc.5 | —（实验/仅检测） | —（实验/仅检测） | `headless --json` 传输契约实测通过（NDJSON 事件、厂商 usage）；headless 无原生权限限制机制，因此角色保持实验，不进入自动路由（`--session-id` 续跑未经验证，不宣称） |
 | Claude Code 2.1.278 | — | 已探测 | `--disallowedTools`+`--strict-mcp-config` 可证边界；本批未实跑，保持已探测 |
 | Codex CLI | 未安装 | 未安装 | 本机未检测到入口；`--sandbox` 契约在 help 可核，安装后 `wagglepost verify codex` 写入验证记录 |
@@ -55,7 +55,7 @@ cargo build --locked --release
 
 | 运行时 | 发现方式 | 需要的配置 |
 | --- | --- | --- |
-| OpenCode | `WAGGLEPOST_OPENCODE_EXE`、`PATH`、或 `D:\dev\tools\opencode-*` 固定版目录 | `DEEPSEEK_API_KEY`（环境变量，仅白名单转发给隔离进程）或 `WAGGLEPOST_OPENCODE_MODEL=provider/model` |
+| OpenCode | `WAGGLEPOST_OPENCODE_EXE`、`PATH`、或 `D:\dev\tools\opencode-*` 固定版目录 | `DEEPSEEK_API_KEY`（环境变量，仅白名单转发给隔离进程）或 `WAGGLEPOST_OPENCODE_MODEL=provider/model` DeepSeek Key 通过环境变量提供。模型选择变量只设置模型 ID，隔离进程不会读取个人 OpenCode 登录状态。 |
 | DSH | `WAGGLEPOST_DSH_EXE`、`PATH`（桌面版自带 `dsh.cmd` 可直接命中） | 其自身登录态；角色为实验，不自动路由 |
 | Codex | `WAGGLEPOST_CODEX_EXE`、`PATH` | 其自身登录态 |
 | Claude Code | `WAGGLEPOST_CLAUDE_EXE`、`PATH`（npm shim 会自动解析到真实 exe） | 其自身登录态 |

@@ -30,10 +30,12 @@ the issue requires a local user, a browser session, or a malicious runtime.
   is read from the user's environment and forwarded only to the isolated runtime
   process via its process environment — never to logs, receipts, the UI or Git.
 - External runtimes launch as argv arrays inside a Windows Job Object (assigned
-  before the first instruction). A reviewer runtime runs under a generated
-  per-attempt deny-list config (edit/shell/webfetch/subagent denied for
-  OpenCode); cancel/timeout require whole-tree exit confirmation before any
-  slot handover.
+  before the first instruction). OpenCode reviews use an isolated home and
+  a filtered snapshot. Project configuration is disabled. The per-attempt
+  policy denies tools by default, permits read, glob and grep, and blocks
+  external directory access. A credential-free preflight checks the exact
+  policy and its sources before each launch. Cancel/timeout require whole-tree
+  exit confirmation before any slot handover.
 - No telemetry.
 
 WagglePost is a local single-user tool, not a multi-tenant hosted service. Do

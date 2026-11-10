@@ -86,10 +86,10 @@ fn write_stub(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 
 /// The WP25 preflight contract every stub must satisfy: `debug config
 /// --standalone` prints the managed document (path via cmd-escaped
-/// %XDG_CONFIG_HOME%) with the five deny rules, exit 0.
+/// %XDG_CONFIG_HOME%) with the exact read-only policy, exit 0.
 const DEBUG_CONFIG_BLOCK: &str = "if /i \"%~1\"==\"debug\" (\r\n\
   if /i \"%~2\"==\"config\" (\r\n\
-    echo [{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\\\\\opencode\\\\\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"edit\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"shell\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"webfetch\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"subagent\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}}]\r\n\
+    echo [{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\opencode\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"*\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"glob\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"grep\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}}]\r\n\
     exit /b 0\r\n\
   )\r\n\
 )\r\n\
@@ -118,7 +118,7 @@ fn opencode_spec_pins_standalone_json_and_managed_body_file() {
     let dir = std::env::temp_dir().join(format!("oc-spec-{}", &wagglepost::ids::new_token()[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let stub = success_stub(&dir);
-    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let ctxv = ctx(&dir, "first_run", Role::Reviewer, None);
     let spec = adapter.build_spec(&ctxv).expect("spec");
     let joined = spec.args.join(" ");
@@ -142,8 +142,14 @@ fn opencode_spec_pins_standalone_json_and_managed_body_file() {
     // per-attempt managed config denies mutations for reviewers
     let base = spec.cwd.parent().unwrap();
     let cfg = std::fs::read_to_string(base.join("config/opencode/opencode.json")).unwrap();
-    assert!(cfg.contains("\"edit\"") && cfg.contains("deny"), "reviewer deny config shipped: {cfg}");
-    assert!(cfg.contains("\"subagent\"") && cfg.contains("external_directory"), "subagent and external_directory bypass denied");
+    let policy: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    assert_eq!(policy["permissions"], json!([
+        {"action":"*","resource":"*","effect":"deny"},
+        {"action":"read","resource":"*","effect":"allow"},
+        {"action":"glob","resource":"*","effect":"allow"},
+        {"action":"grep","resource":"*","effect":"allow"},
+        {"action":"external_directory","resource":"*","effect":"deny"},
+    ]));
     // provider key forwarded from the environment only (whitelist), XDG redirected
     assert!(spec.env.iter().all(|(k, _)| k != "WAGGLEPOST_SECRET_CANARY"), "env is filtered");
     assert!(spec.env.iter().any(|(k, _)| k == "XDG_CONFIG_HOME"));
@@ -155,7 +161,7 @@ fn opencode_writer_is_experimental_flagged_not_reviewer_deny() {
     let dir = std::env::temp_dir().join(format!("oc-wr-{}", &wagglepost::ids::new_token()[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let stub = success_stub(&dir);
-    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let ctxv = ctx(&dir, "first_run", Role::Writer, None);
     let spec = adapter.build_spec(&ctxv).expect("spec");
     let file_pos = spec.args.iter().position(|a| a == "--file").unwrap();
@@ -172,7 +178,7 @@ fn opencode_parse_full_stream_usage_and_result() {
     let dir = std::env::temp_dir().join(format!("oc-run-{}", &wagglepost::ids::new_token()[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let stub = success_stub(&dir);
-    let mut adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let mut adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let cancel = Arc::new(AtomicBool::new(false));
     let collected: std::sync::Mutex<Vec<WireEvent>> = std::sync::Mutex::new(Vec::new());
     let outcome = run_attempt(&mut adapter, &ctx(&dir, "first_run", Role::Reviewer, None), cancel, &|e: &WireEvent| {
@@ -210,7 +216,7 @@ fn opencode_parse_full_stream_usage_and_result() {
 
 #[test]
 fn opencode_broken_chunks_unknown_events_and_framing() {
-    let mut adapter = OpencodeAdapter::new(PathBuf::from("unused"), "v".into());
+    let mut adapter = OpencodeAdapter::new(PathBuf::from("unused"), "v".into(), None);
     assert!(adapter.parse_line("{\"type\":\"step_sta").is_empty());
     assert!(adapter.parse_line("garbage").is_empty());
     assert!(adapter.parse_line("").is_empty());
@@ -228,7 +234,7 @@ fn opencode_broken_chunks_unknown_events_and_framing() {
 
 #[test]
 fn opencode_auth_quota_and_exit_classification() {
-    let adapter = OpencodeAdapter::new(PathBuf::from("unused"), "v".into());
+    let adapter = OpencodeAdapter::new(PathBuf::from("unused"), "v".into(), None);
     let mk = |stderr: &str, code: Option<i32>| wagglepost::runner::ExitOutcome {
         exit_code: code,
         stderr: stderr.as_bytes().to_vec(),
@@ -255,7 +261,7 @@ fn opencode_cancel_confirms_tree_exit() {
             + DEBUG_CONFIG_BLOCK
             + "ping -n 61 127.0.0.1 >nul\r\n"),
     );
-    let mut adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let mut adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let cancel = Arc::new(AtomicBool::new(false));
     let c2 = cancel.clone();
     std::thread::spawn(move || {
@@ -276,7 +282,7 @@ fn opencode_resume_delta_refused_fail_closed() {
     let dir = std::env::temp_dir().join(format!("oc-res-{}", &wagglepost::ids::new_token()[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let stub = success_stub(&dir);
-    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let err = adapter
         .build_spec(&ctx(&dir, "resume_delta", Role::Reviewer, Some("ses_prev_77")))
         .err()
@@ -359,34 +365,36 @@ fn wp25_preflight_refuses_injected_config_before_spawn() {
         "@echo off\r\n\
 if /i \"%~1\"==\"debug\" (\r\n\
   if /i \"%~2\"==\"config\" (\r\n\
-    echo [{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\\\\\opencode\\\\\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"edit\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"shell\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"webfetch\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"subagent\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}}\r\n\
+    echo [{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\opencode\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"*\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"read\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"glob\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"grep\",\"resource\":\"*\",\"effect\":\"allow\"},{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}]}}\r\n\
     echo ,{\"type\":\"document\",\"path\":\"C:\\\\candidate\\\\repo\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"edit\",\"resource\":\"*\",\"effect\":\"allow\"}]}}]\r\n\
     exit /b 0\r\n\
   )\r\n\
 )\r\n\
 exit /b 1\r\n",
     );
-    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into());
+    let adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let ctxv = ctx(&dir, "first_run", Role::Reviewer, None);
     let err = adapter.build_spec(&ctxv).err().expect("injected config refuses the launch");
-    assert!(err.contains("non-managed config") || err.contains("config document"),
+    assert!(err.contains("unexpected config source") || err.contains("config document"),
         "preflight names the injection: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn wp26_probe_env_never_carries_credentials() {
-    // a fake key in the parent environment must NOT appear in any probe env
-    std::env::set_var("DEEPSEEK_API_KEY", "sk-fake-not-a-real-key-000");
     let base = std::env::temp_dir().join(format!("oc-wp26-{}", &wagglepost::ids::new_token()[..8]));
     let cfg_dir = base.join("config");
-    let env = wagglepost::adapters::opencode::probe_child_env(&base, &cfg_dir);
+    let env = wagglepost::adapters::opencode::probe_child_env(&base, &cfg_dir).unwrap();
     assert!(
-        !env.iter().any(|(k, v)| k == "DEEPSEEK_API_KEY" || v.contains("sk-fake-not-a-real-key")),
+        !env.iter().any(|(k, _)| k == "DEEPSEEK_API_KEY"),
         "probe env must be credential-free: {:?}",
         env.iter().filter(|(k, _)| k.contains("DEEPSEEK")).collect::<Vec<_>>()
     );
     assert!(env.iter().any(|(k, _)| k == "XDG_CONFIG_HOME"), "probe env is still XDG-isolated");
-    std::env::remove_var("DEEPSEEK_API_KEY");
+    let vars: std::collections::HashMap<_, _> = env.into_iter().collect();
+    for name in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        assert_eq!(vars[name], base.join("home").to_string_lossy());
+    }
+    assert_eq!(vars["OPENCODE_DISABLE_PROJECT_CONFIG"], "1");
     std::fs::remove_dir_all(&base).ok();
 }

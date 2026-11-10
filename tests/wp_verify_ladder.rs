@@ -16,13 +16,14 @@ fn opencode_env(extra: &str) -> std::sync::Arc<TestEnv> {
             "@echo off\r\n\
 if /i \"%~1\"==\"--version\" (\r\n  echo opencode 2.2.6\r\n  exit /b 0\r\n)\r\n\
 if /i \"%~1\"==\"run\" (\r\n  if /i \"%~2\"==\"--help\" (\r\n    echo Usage: opencode run [flags]\r\n    echo   --standalone           private server\r\n    echo   --format choice        default or json\r\n    echo   --session, -s string   session id\r\n    exit /b 0\r\n  )\r\n)\r\n\
-if /i \"%~1\"==\"debug\" (\r\n  if /i \"%~2\"==\"config\" (\r\n    echo [{{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\opencode\\\\opencode.json\",\"info\":{{\"permissions\":[{{\"action\":\"edit\",\"resource\":\"*\",\"effect\":\"deny\"}},{{\"action\":\"shell\",\"resource\":\"*\",\"effect\":\"deny\"}},{{\"action\":\"webfetch\",\"resource\":\"*\",\"effect\":\"deny\"}},{{\"action\":\"subagent\",\"resource\":\"*\",\"effect\":\"deny\"}},{{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}}]}}}}{extra}]\r\n    exit /b 0\r\n  )\r\n)\r\n\
+if /i \"%~1\"==\"debug\" (\r\n  if /i \"%~2\"==\"config\" (\r\n    echo [{{\"type\":\"document\",\"path\":\"%XDG_CONFIG_HOME:\\=\\\\%\\\\opencode\\\\opencode.json\",\"info\":{{\"permissions\":[{{\"action\":\"*\",\"resource\":\"*\",\"effect\":\"deny\"}},{{\"action\":\"read\",\"resource\":\"*\",\"effect\":\"allow\"}},{{\"action\":\"glob\",\"resource\":\"*\",\"effect\":\"allow\"}},{{\"action\":\"grep\",\"resource\":\"*\",\"effect\":\"allow\"}},{{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"}}]}}}}{extra}]\r\n    exit /b 0\r\n  )\r\n)\r\n\
 exit /b 1\r\n",
             extra = extra
         );
         std::fs::write(&stub, body).unwrap();
         cfg.opencode_exe = stub;
         cfg.opencode_version = Some("opencode 2.2.6".into());
+        cfg.opencode_model_configured = true;
     })
 }
 
@@ -50,7 +51,7 @@ fn wp22_injected_candidate_config_fails_verification() {
         ",{\"type\":\"document\",\"path\":\"C:\\\\candidate\\\\repo\\\\opencode.json\",\"info\":{\"permissions\":[{\"action\":\"edit\",\"resource\":\"*\",\"effect\":\"allow\"}]}}",
     );
     let err = env.core.verify_adapter("opencode").err().expect("injected config must refuse");
-    assert!(format!("{err:?}").contains("non-managed config") || format!("{err:?}").contains("verify_failed"),
+    assert!(format!("{err:?}").contains("non-managed policy") || format!("{err:?}").contains("verify_failed"),
         "refusal names the injection: {err:?}");
     // and nothing was recorded: no routable role
     let rec = env.core.capability_records().into_iter().find(|r| r.adapter == "opencode").unwrap();
@@ -71,6 +72,7 @@ exit /b 3\r\n",
         .unwrap();
         cfg.opencode_exe = stub;
         cfg.opencode_version = Some("opencode 2.2.6".into());
+        cfg.opencode_model_configured = true;
     });
     let err = env.core.verify_adapter("opencode").err().expect("nonzero probe must refuse");
     assert!(format!("{err:?}").contains("exit"), "refusal names the exit: {err:?}");
@@ -209,7 +211,7 @@ fn wp26_verify_failure_revokes_previous_roles() {
             r#")"#,
             r#"if /i "%~1"=="debug" ("#,
             r#"  if /i "%~2"=="config" ("#,
-            r#"    echo [{"type":"document","path":"%XDG_CONFIG_HOME:\=\\%\\opencode\\opencode.json","info":{"permissions":[{"action":"edit","resource":"*","effect":"deny"}]}}"#,
+            r#"    echo [{"type":"document","path":"%XDG_CONFIG_HOME:\=\\%\\opencode\\opencode.json","info":{"permissions":[{"action":"*","resource":"*","effect":"deny"}]}}"#,
             r#"    echo ,{"type":"document","path":"C:\\candidate\\repo\\opencode.json","info":{"permissions":[{"action":"edit","resource":"*","effect":"allow"}]}}]"#,
             r#"    exit /b 0"#,
             r#"  )"#,

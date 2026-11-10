@@ -175,7 +175,7 @@ impl RunningChild {
                 let g = self.job.inner.lock().unwrap();
                 match g.as_ref() {
                     Some(job) => {
-                        if job.process_count() == 0 {
+                        if job.process_count() == Some(0) {
                             return (true, false);
                         }
                     }
@@ -194,7 +194,7 @@ impl RunningChild {
                     {
                         let g = self.job.inner.lock().unwrap();
                         if let Some(job) = g.as_ref() {
-                            if job.process_count() == 0 {
+                            if job.process_count() == Some(0) {
                                 return (true, true);
                             }
                         }
@@ -365,7 +365,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
+        CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
     use std::sync::Mutex;
@@ -388,30 +388,23 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         pub fn wait(&self, timeout_ms: u32) -> bool {
             unsafe { WaitForSingleObject(self.proc, timeout_ms) == 0 }
         }
-        /// Live processes in the job. Query failure is treated as "empty" so a
-        /// conservative caller must not block forever on unobservable trees.
-        pub fn process_count(&self) -> u32 {
+        /// A failed query cannot prove that the job is empty.
+        pub fn process_count(&self) -> Option<u32> {
             use windows_sys::Win32::System::JobObjects::{
-                JobObjectBasicProcessIdList, QueryInformationJobObject,
+                JobObjectBasicAccountingInformation, QueryInformationJobObject,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
             };
-            // 1024 pid slots + header
-            let mut buf = vec![0u8; 8 + 1024 * 8];
-            let mut ret: u32 = 0;
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
             let ok = unsafe {
                 QueryInformationJobObject(
                     self.job,
-                    JobObjectBasicProcessIdList,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len() as u32,
-                    &mut ret,
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
                 )
             };
-            if ok == 0 {
-                return 0;
-            }
-            // JOBOBJECT_BASIC_PROCESS_ID_LIST: DWORD assigned; DWORD inList; pids...
-            let count = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0u8; 4]));
-            count
+            (ok != 0).then_some(info.ActiveProcesses)
         }
 
         pub fn exit_code(&self) -> Option<i32> {
@@ -429,6 +422,15 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         }
         pub fn stderr_truncated(&self) -> bool {
             *self.stderr.1.lock().unwrap()
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.job);
+                CloseHandle(self.proc);
+            }
         }
     }
 
@@ -487,6 +489,16 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         err_write: HANDLE,
     }
 
+    impl Drop for Pipes {
+        fn drop(&mut self) {
+            for handle in [self.in_read, self.in_write, self.out_read, self.out_write, self.err_read, self.err_write] {
+                if !handle.is_null() {
+                    unsafe { CloseHandle(handle) };
+                }
+            }
+        }
+    }
+
     fn make_pipes() -> Result<Pipes, String> {
         let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
         sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
@@ -505,11 +517,10 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         if ok0 == 0 || ok1 == 0 || ok2 == 0 {
             return Err("CreatePipe failed".into());
         }
-        unsafe {
-            // parent-side ends must not be inherited
-            SetHandleInformation(p.in_write, HANDLE_FLAG_INHERIT, 0);
-            SetHandleInformation(p.out_read, HANDLE_FLAG_INHERIT, 0);
-            SetHandleInformation(p.err_read, HANDLE_FLAG_INHERIT, 0);
+        for handle in [p.in_write, p.out_read, p.err_read] {
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err("SetHandleInformation failed".into());
+            }
         }
         Ok(p)
     }
@@ -523,7 +534,10 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
     }
 
     pub fn spawn_in_job(spec: &super::SpawnSpec) -> Result<Spawned, String> {
-        let pipes = make_pipes()?;
+        // Keep inheritable pipe ends from crossing concurrent runner launches.
+        static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = SPAWN_LOCK.lock().unwrap();
+        let mut pipes = make_pipes()?;
         let exe_w = to_wide(&extended_path(Path::new(&spec.exe)).to_string_lossy());
         let mut cmdline = quote_arg(&spec.exe.to_string_lossy());
         for a in &spec.args {
@@ -566,14 +580,15 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
         }
         // close child-side write ends in the parent so EOF propagates
         unsafe {
-            CloseHandle(pipes.in_read);
-            CloseHandle(pipes.out_write);
-            CloseHandle(pipes.err_write);
+            CloseHandle(std::mem::replace(&mut pipes.in_read, std::ptr::null_mut()));
+            CloseHandle(std::mem::replace(&mut pipes.out_write, std::ptr::null_mut()));
+            CloseHandle(std::mem::replace(&mut pipes.err_write, std::ptr::null_mut()));
         }
 
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             unsafe {
+                TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
@@ -593,6 +608,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
             unsafe {
                 TerminateJobObject(job, 1);
                 CloseHandle(job);
+                TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
@@ -603,6 +619,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
             unsafe {
                 TerminateJobObject(job, 1);
                 CloseHandle(job);
+                TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
             }
@@ -620,9 +637,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetHandleInforma
                 proc: pi.hProcess,
                 stderr: std::sync::Arc::new((Mutex::new(Vec::new()), Mutex::new(false))),
             },
-            out_read: pipes.out_read,
-            err_read: pipes.err_read,
-            in_write: pipes.in_write,
+            out_read: std::mem::replace(&mut pipes.out_read, std::ptr::null_mut()),
+            err_read: std::mem::replace(&mut pipes.err_read, std::ptr::null_mut()),
+            in_write: std::mem::replace(&mut pipes.in_write, std::ptr::null_mut()),
         })
     }
 
@@ -874,86 +891,87 @@ fn read_lines_from_reader<R: std::io::Read>(r: &mut R, tx: std::sync::mpsc::Send
     }
 }
 
-/// WP22/WP25/WP26: run a probe subprocess with a hard timeout, require exit 0,
-/// and cap the captured output. Any overrun/nonzero exit/missing marker fails
-/// the contract. The caller supplies the FULL child environment — probes that
-/// must never see credentials pass an env without them. Pipes are drained on
-/// dedicated threads so the timeout can fire even when the child goes silent.
-/// Returns the capped stdout+stderr text.
+/// Capture raw probe output without sending it through the runtime NDJSON splitter.
+/// An oversized frame must fail a probe even if another frame contains valid JSON.
+#[cfg(windows)]
 pub fn bounded_probe(
     exe: &std::path::Path,
     args: &[&str],
     cwd: Option<&std::path::Path>,
     env: &[(String, String)],
-    timeout: std::time::Duration,
+    timeout: Duration,
     accept: impl Fn(&str) -> bool,
 ) -> Result<String, String> {
-    const PROBE_OUTPUT_CAP: usize = 1024 * 1024; // 1 MiB
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(args)
-        .env_clear()
-        .envs(env.iter().cloned())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(c) = cwd {
-        cmd.current_dir(c);
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("probe spawn: {e}"))?;
-    fn drain_capped(pipe: Option<impl std::io::Read + Send + 'static>, cap: usize) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
-        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::default();
-        if let Some(mut pipe) = pipe {
-            let sink = buf.clone();
-            std::thread::spawn(move || {
-                let mut chunk = [0u8; 16384];
-                loop {
-                    match pipe.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let mut s = sink.lock().unwrap();
-                            let take = n.min(cap.saturating_sub(s.len()));
-                            s.extend_from_slice(&chunk[..take]);
-                        }
-                    }
-                }
-            });
-        }
-        buf
-    }
-    let out_buf = drain_capped(child.stdout.take(), PROBE_OUTPUT_CAP);
-    let err_buf = drain_capped(child.stderr.take(), PROBE_OUTPUT_CAP);
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {}
-            Err(e) => return Err(format!("probe wait: {e}")),
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "probe timed out after {}s and was killed (fail closed)",
-                timeout.as_secs()
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    const CAP: usize = 1024 * 1024;
+    let spec = SpawnSpec {
+        exe: exe.to_path_buf(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        cwd: match cwd {
+            Some(path) => path.to_path_buf(),
+            None => std::env::current_dir().map_err(|e| format!("probe working directory: {e}"))?,
+        },
+        env: env.to_vec(),
+        stdin_text: String::new(),
     };
-    if !status.success() {
-        return Err(format!(
-            "probe exited {:?} (nonzero exits never enable a capability)",
-            status.code()
-        ));
+    let child = winproc::spawn_in_job(&spec)?;
+    winproc::close_read(child.in_write);
+    let capture = |pipe: winproc::SendHandle| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let bytes = Mutex::new(Vec::new());
+            let overflow = Mutex::new(false);
+            winproc::drain_pipe_to(pipe, &bytes, &overflow, CAP);
+            let _ = tx.send((bytes.into_inner().unwrap(), overflow.into_inner().unwrap()));
+        });
+        rx
+    };
+    let stdout = capture(winproc::SendHandle(child.out_read));
+    let stderr = capture(winproc::SendHandle(child.err_read));
+    let deadline = std::time::Instant::now() + timeout;
+    while !(child.job.wait(0) && child.job.process_count() == Some(0)) {
+        if std::time::Instant::now() >= deadline {
+            child.job.kill();
+            let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !(child.job.wait(0) && child.job.process_count() == Some(0)) {
+                if std::time::Instant::now() >= cleanup_deadline {
+                    return Err("probe timed out and whole-tree exit could not be confirmed".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = stdout.recv_timeout(cleanup_deadline.saturating_duration_since(std::time::Instant::now()));
+            let _ = stderr.recv_timeout(cleanup_deadline.saturating_duration_since(std::time::Instant::now()));
+            return Err("probe timed out; its process tree was terminated".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    // give the drain threads a beat to flush the tail
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out_buf.lock().unwrap()),
-        String::from_utf8_lossy(&err_buf.lock().unwrap())
-    );
+    let receive = |pipe: std::sync::mpsc::Receiver<(Vec<u8>, bool)>| {
+        pipe.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|_| "probe output did not reach EOF before its deadline")
+    };
+    let (mut out, stdout_overflow) = receive(stdout)?;
+    let (err, stderr_overflow) = receive(stderr)?;
+    if stdout_overflow || stderr_overflow || out.len() + err.len() > CAP {
+        return Err("probe output exceeded the 1 MiB cap".into());
+    }
+    if child.job.exit_code() != Some(0) {
+        return Err(format!("probe exited {:?}", child.job.exit_code()));
+    }
+    out.extend_from_slice(&err);
+    let text = String::from_utf8(out).map_err(|_| "probe output was not UTF-8")?;
     if !accept(&text) {
         return Err("probe output did not satisfy the contract".into());
     }
     Ok(text)
+}
+
+#[cfg(not(windows))]
+pub fn bounded_probe(
+    _exe: &std::path::Path,
+    _args: &[&str],
+    _cwd: Option<&std::path::Path>,
+    _env: &[(String, String)],
+    _timeout: Duration,
+    _accept: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    Err("contained native runtime probes require Windows".into())
 }

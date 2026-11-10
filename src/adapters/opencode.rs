@@ -17,7 +17,7 @@
 //! while STRIPPING every candidate-supplied agent config/instruction surface
 //! (opencode.json(c), .opencode/, AGENTS.md, CLAUDE.md, .mcp.json, editor
 //! configs, .git*) and skipping symlinks/reparse points (链接逃逸). The managed
-//! per-attempt XDG config denies edit/shell/webfetch/subagent/external_directory;
+//! per-attempt policy denies by default and permits only read, glob and grep;
 //! the offline boundary probe (no model) asserts via `debug config --standalone`
 //! that ONLY the managed document loads and the deny rules are in effect.
 //!
@@ -61,7 +61,18 @@ const STRIP_FILES: &[&str] = &[
     ".git",
     HANDOFF_FILE,
 ];
-const STRIP_DIRS: &[&str] = &[".git", ".opencode", ".claude", ".cursor", ".windsurf", ".gemini", ".wagglepost"];
+const STRIP_DIRS: &[&str] = &[
+    ".git",
+    ".opencode",
+    ".claude",
+    ".cursor",
+    ".windsurf",
+    ".gemini",
+    ".wagglepost",
+    // WP29: candidate-supplied compat skill/agent definitions are an execution
+    // and context-injection surface — never copied into the snapshot
+    ".agents",
+];
 
 /// WP25: Windows filesystems are case-insensitive — the strip comparison must be
 /// too, or "OpenCode.JSON" survives the copy and overrides the managed config.
@@ -78,14 +89,18 @@ fn strip_dir_name(name: &str) -> bool {
 pub struct OpencodeAdapter {
     pub exe: PathBuf,
     pub version: String,
+    model_override: Option<String>,
 }
 
 impl OpencodeAdapter {
-    pub fn new(exe: PathBuf, version: String) -> Self {
-        OpencodeAdapter { exe, version }
+    pub fn new(exe: PathBuf, version: String, model_override: Option<String>) -> Self {
+        Self { exe, version, model_override }
     }
 
     fn model(&self) -> Result<String, String> {
+        if let Some(model) = &self.model_override {
+            return Ok(model.clone());
+        }
         if let Ok(m) = std::env::var(DEFAULT_MODEL_ENV) {
             if !m.trim().is_empty() {
                 return Ok(m.trim().to_string());
@@ -149,68 +164,43 @@ fn copy_tree_filtered(src: &Path, dst: &Path, depth: usize) -> Result<(), String
     Ok(())
 }
 
-/// WP21: the managed reviewer deny config (the ONLY config the runtime may see).
+/// Exact ordered policy written to disk and checked against the CLI's report.
+const REVIEWER_CONFIG: &str = r#"{"permissions":[
+    {"action":"*","resource":"*","effect":"deny"},
+    {"action":"read","resource":"*","effect":"allow"},
+    {"action":"glob","resource":"*","effect":"allow"},
+    {"action":"grep","resource":"*","effect":"allow"},
+    {"action":"external_directory","resource":"*","effect":"deny"}]}"#;
+
 pub fn write_reviewer_config(config_dir: &Path) -> Result<PathBuf, String> {
     let dir = config_dir.join("opencode");
     std::fs::create_dir_all(&dir).map_err(|e| format!("reviewer config dir: {e}"))?;
     let path = dir.join("opencode.json");
-    std::fs::write(
-        &path,
-        r#"{"permissions":[
-        {"action":"edit","resource":"*","effect":"deny"},
-        {"action":"shell","resource":"*","effect":"deny"},
-        {"action":"webfetch","resource":"*","effect":"deny"},
-        {"action":"subagent","resource":"*","effect":"deny"},
-        {"action":"external_directory","resource":"*","effect":"deny"}]}"#,
-    )
-    .map_err(|e| format!("reviewer config: {e}"))?;
+    std::fs::write(&path, REVIEWER_CONFIG).map_err(|e| format!("reviewer config: {e}"))?;
     Ok(path)
 }
 
-/// XDG env entries pointing every OpenCode state root at the managed run dir.
-fn xdg_env_entries(base: &Path, config_dir: &Path) -> Vec<(String, String)> {
-    for d in ["data", "cache", "state"] {
-        std::fs::create_dir_all(base.join(d)).ok();
+/// Probe and dispatch use the same isolated homes. Only dispatch can add a key.
+pub fn probe_child_env(base: &Path, config_dir: &Path) -> Result<Vec<(String, String)>, String> {
+    let home = base.join("home");
+    for dir in [home.clone(), base.join("data"), base.join("cache"), base.join("state")] {
+        std::fs::create_dir_all(dir).map_err(|e| format!("OpenCode state directory: {e}"))?;
     }
-    vec![
-        ("XDG_CONFIG_HOME".into(), config_dir.to_string_lossy().to_string()),
-        ("XDG_DATA_HOME".into(), base.join("data").to_string_lossy().to_string()),
-        ("XDG_CACHE_HOME".into(), base.join("cache").to_string_lossy().to_string()),
-        ("XDG_STATE_HOME".into(), base.join("state").to_string_lossy().to_string()),
-    ]
-}
-
-fn child_env(base: &Path, config_dir: &Path) -> Vec<(String, String)> {
     let mut env = crate::runner::filter_env(&[]);
-    for (k, v) in xdg_env_entries(base, config_dir) {
-        env.retain(|(ek, _)| ek != &k);
-        env.push((k, v));
-    }
-    // explicit single-key whitelist: the provider key is read from the user's
-    // environment (its existing authorized source) and forwarded only to this
-    // isolated process; it is never logged, persisted or echoed
-    if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-        env.retain(|(ek, _)| ek != "DEEPSEEK_API_KEY");
-        env.push(("DEEPSEEK_API_KEY".into(), key));
-    }
-    env
-}
-
-/// WP26: the environment for OFFLINE opencode probes — credential-free (no
-/// provider key is ever whitelisted into a probe) and XDG-isolated. Bounded by
-/// runner::bounded_probe (timeout kill, exit-0 required, 1 MiB output cap) —
-/// never .output().
-pub fn probe_child_env(state_base: &Path, config_dir: &Path) -> Vec<(String, String)> {
-    let mut env = crate::runner::filter_env(&[]);
-    env.retain(|(k, _)| {
-        let ku = k.to_ascii_uppercase();
-        !(ku.contains("KEY") || ku.contains("TOKEN") || ku.contains("SECRET") || ku.contains("API"))
+    env.retain(|(key, _)| {
+        !matches!(key.as_str(), "HOME" | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "HOMEDRIVE" | "HOMEPATH")
     });
-    for (k, v) in xdg_env_entries(state_base, config_dir) {
-        env.retain(|(ek, _)| ek != &k);
-        env.push((k, v));
+    for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        env.push((key.into(), home.to_string_lossy().into_owned()));
     }
-    env
+    env.extend([
+        ("XDG_CONFIG_HOME".into(), config_dir.to_string_lossy().into_owned()),
+        ("XDG_DATA_HOME".into(), base.join("data").to_string_lossy().into_owned()),
+        ("XDG_CACHE_HOME".into(), base.join("cache").to_string_lossy().into_owned()),
+        ("XDG_STATE_HOME".into(), base.join("state").to_string_lossy().into_owned()),
+        ("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into()),
+    ]);
+    Ok(env)
 }
 
 /// WP25/WP26: run `debug config --standalone` with the managed config and the
@@ -225,49 +215,44 @@ pub fn debug_config(
         exe,
         &["debug", "config", "--standalone"],
         Some(cwd),
-        &probe_child_env(state_base, config_dir),
+        &probe_child_env(state_base, config_dir)?,
         std::time::Duration::from_secs(30),
         |_| true,
     )
 }
 
-/// WP21: the loaded-document list must contain our managed deny rules and NO
-/// document from the snapshot cwd (a candidate config would appear here).
-pub fn assert_boundary_holds(raw: &str, managed_config_path: &str) -> Result<(), String> {
-    let docs: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("debug config JSON: {e}"))?;
-    // WP25: normalize separators/case for the prefix test — the managed root may
-    // arrive with forward slashes (CLI/env) while opencode reports canonical
-    // backslash paths; Windows paths are case-insensitive
-    let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
-    let managed_norm = norm(managed_config_path);
-    let mut found_deny = std::collections::HashSet::new();
-    for doc in &docs {
-        let path = doc.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        if norm(path).starts_with(&managed_norm) {
-            if let Some(rules) = doc.pointer("/info/permissions").and_then(|p| p.as_array()) {
-                for r in rules {
-                    let action = r.get("action").and_then(|a| a.as_str()).unwrap_or("");
-                    let effect = r.get("effect").and_then(|e| e.as_str()).unwrap_or("");
-                    if effect == "deny" {
-                        found_deny.insert(action.to_string());
-                    }
-                }
-            }
-        } else if !path.is_empty() {
-            // any OTHER loaded document is a config-injection vector
-            let snapshot_leak = !path.contains(std::env::temp_dir().to_string_lossy().as_ref())
-                || doc.get("info").is_some();
-            if snapshot_leak {
-                return Err(format!(
-                    "a non-managed config document was loaded: {path} — candidate override is possible"
-                ));
-            }
+/// Accept only the generated policy and its containing directory. Comparing the
+/// whole ordered rule array rejects resource narrowing, extra rules and plugins.
+pub fn assert_boundary_holds(raw: &str, managed_config_file: &str) -> Result<(), String> {
+    fn same_path(reported: &str, expected: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            reported.replace('/', "\\").eq_ignore_ascii_case(&expected.to_string_lossy().replace('/', "\\"))
+        }
+        #[cfg(not(windows))]
+        {
+            Path::new(reported) == expected
         }
     }
-    for required in ["edit", "shell", "webfetch", "subagent", "external_directory"] {
-        if !found_deny.contains(required) {
-            return Err(format!("managed deny rule missing from the effective config: {required}"));
+
+    let file = Path::new(managed_config_file);
+    let dir = file.parent().ok_or("managed config has no directory")?;
+    let docs: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("debug config JSON: {e}"))?;
+    let expected: Value = serde_json::from_str(REVIEWER_CONFIG).expect("fixed reviewer policy is JSON");
+    let mut saw_file = false;
+    let mut saw_dir = false;
+    for doc in docs {
+        let object = doc.as_object().ok_or("unknown config source shape")?;
+        let path = doc.get("path").and_then(Value::as_str).ok_or("missing config source path")?;
+        match doc.get("type").and_then(Value::as_str) {
+            Some("document") if !saw_file && same_path(path, file) && object.len() == 3
+                && doc.get("info") == Some(&expected) => saw_file = true,
+            Some("directory") if !saw_dir && same_path(path, dir) && object.len() == 2 => saw_dir = true,
+            _ => return Err("unexpected config source or non-managed policy".into()),
         }
+    }
+    if !saw_file {
+        return Err("managed config document was not loaded".into());
     }
     Ok(())
 }
@@ -285,7 +270,7 @@ pub fn preflight_effective_config(
     cwd: &Path,
 ) -> Result<(), String> {
     let out = debug_config(exe, config_dir, state_base, cwd)?;
-    assert_boundary_holds(&out, config_dir.to_string_lossy().as_ref())
+    assert_boundary_holds(&out, &config_dir.join("opencode").join("opencode.json").to_string_lossy())
 }
 
 impl Adapter for OpencodeAdapter {
@@ -295,6 +280,7 @@ impl Adapter for OpencodeAdapter {
 
     fn build_spec(&self, ctx: &DispatchContext) -> Result<SpawnSpec, String> {
         let model = self.model()?;
+        let uses_deepseek = model.starts_with("deepseek/");
         let base = ctx
             .managed_root
             .join("opencode-runs")
@@ -358,11 +344,17 @@ impl Adapter for OpencodeAdapter {
             args.extend(["--session".into(), session]);
         }
         args.extend(["--file".into(), file_arg, BODY_INSTRUCTION.into()]);
+        let mut env = probe_child_env(&base, &config_dir)?;
+        if uses_deepseek {
+            if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+                env.push(("DEEPSEEK_API_KEY".into(), key));
+            }
+        }
         Ok(SpawnSpec {
             exe: self.exe.clone(),
             args,
             cwd,
-            env: child_env(&base, &config_dir),
+            env,
             stdin_text: String::new(),
         })
     }
