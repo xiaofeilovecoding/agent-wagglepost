@@ -116,8 +116,10 @@ fn discover_opencode() -> Option<PathBuf> {
             return Some(resolved);
         }
     }
-    for root in ["D:/dev/tools", "C:/Users/ExampleUser/AppData/Local/Programs"] {
-        let root = PathBuf::from(root);
+    let roots = std::iter::once(PathBuf::from("D:/dev/tools")).chain(
+        std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Programs")),
+    );
+    for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
