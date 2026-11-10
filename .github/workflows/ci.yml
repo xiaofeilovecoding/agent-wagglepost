@@ -44,7 +44,7 @@ jobs:
       - name: Offline unit and integration tests (locked)
         env:
           WAGGLEPOST_TEST_HTTP_DIAG: "1"
-        run: cargo test --offline --locked --release -- --test-threads=2
+        run: cargo test --offline --locked --release --no-fail-fast -- --test-threads=2
 
       - name: Offline production build (locked)
         run: cargo build --offline --locked --release

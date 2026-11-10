@@ -79,3 +79,23 @@ fn probe_rejects_oversized_frame_and_terminates_descendants() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(!path.exists(), "grandchild escaped the probe job");
 }
+
+#[test]
+fn snapshot_retries_a_transient_windows_share_violation() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let root = std::env::temp_dir().join(wagglepost::ids::new_token());
+    let source = root.join("source");
+    let snapshot = root.join("snapshot");
+    std::fs::create_dir_all(&source).unwrap();
+    let path = source.join("lib.txt");
+    std::fs::write(&path, "candidate contents").unwrap();
+    let exclusive = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(65));
+        drop(exclusive);
+    });
+    wagglepost::adapters::opencode::prepare_snapshot(&source, &snapshot).unwrap();
+    release.join().unwrap();
+    assert_eq!(std::fs::read_to_string(snapshot.join("lib.txt")).unwrap(), "candidate contents");
+    std::fs::remove_dir_all(root).unwrap();
+}

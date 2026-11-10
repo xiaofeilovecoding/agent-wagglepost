@@ -157,11 +157,24 @@ fn copy_tree_filtered(src: &Path, dst: &Path, depth: usize) -> Result<(), String
             if strip_name(&name_s) {
                 continue;
             }
-            std::fs::copy(entry.path(), dst.join(&name))
+            copy_snapshot_file(&entry.path(), &dst.join(&name))
                 .map_err(|e| format!("snapshot copy {}: {e}", name_s))?;
         }
     }
     Ok(())
+}
+
+/// Windows scanners can briefly deny sharing of a freshly created file.
+fn copy_snapshot_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for delay in [25, 50, 100, 200] {
+        match std::fs::copy(src, dst) {
+            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            result => return result.map(|_| ()),
+        }
+    }
+    std::fs::copy(src, dst).map(|_| ())
 }
 
 /// Exact ordered policy written to disk and checked against the CLI's report.

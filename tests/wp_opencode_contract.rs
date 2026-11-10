@@ -8,7 +8,6 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use wagglepost::adapters::opencode::OpencodeAdapter;
 use wagglepost::adapters::{run_attempt, Adapter, DispatchContext, WireEvent};
 use wagglepost::model::{HandoffBody, Role};
@@ -24,9 +23,10 @@ fn handoff(mode: &str) -> HandoffBody {
     }
 }
 
-fn ctx(worktree: &std::path::Path, mode: &str, role: Role, native: Option<&str>) -> DispatchContext {
-    // managed root MUST live outside the worktree (the snapshot copies the tree)
-    let managed = worktree.parent().unwrap().join("managed");
+fn ctx(root: &std::path::Path, mode: &str, role: Role, native: Option<&str>) -> DispatchContext {
+    let worktree = root.join("worktree-src");
+    let managed = root.join("managed");
+    std::fs::create_dir_all(&worktree).unwrap();
     std::fs::create_dir_all(&managed).unwrap();
     // candidate-style content the snapshot must carry over
     std::fs::write(worktree.join("lib.txt"), "candidate content
@@ -263,12 +263,12 @@ fn opencode_cancel_confirms_tree_exit() {
     );
     let mut adapter = OpencodeAdapter::new(stub, "opencode v2.2.6".into(), Some("fixture/model".into()));
     let cancel = Arc::new(AtomicBool::new(false));
-    let c2 = cancel.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(700));
-        c2.store(true, Ordering::SeqCst);
-    });
-    let outcome = run_attempt(&mut adapter, &ctx(&dir, "first_run", Role::Reviewer, None), cancel, &|_| {})
+    let cancel_on_start = cancel.clone();
+    let outcome = run_attempt(&mut adapter, &ctx(&dir, "first_run", Role::Reviewer, None), cancel, &|event| {
+        if event.kind == "agent_started" {
+            cancel_on_start.store(true, Ordering::SeqCst);
+        }
+    })
         .expect("run returns");
     assert!(outcome.exit.killed);
     assert!(outcome.exit.stop_confirmed, "whole-tree stop evidence (H2/H4)");
