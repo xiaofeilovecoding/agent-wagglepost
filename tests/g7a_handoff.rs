@@ -152,14 +152,15 @@ fn g7a_relay_package_is_minimal_and_bounded() {
     let rbody = review_preview["handoff"]["text"].as_str().unwrap();
     assert_eq!(review_preview["handoff"]["mode"], json!("review"));
     assert!(rbody.contains("完整哈希 / full hash:"), "reviewer sees candidate identity");
-    assert!(rbody.contains("关键变更 / Key changes"), "reviewer starts from the change list");
+    assert!(rbody.contains("关键变更路径 / Key change paths"), "reviewer starts from the change list");
 }
 
 #[test]
-fn g7a_overlong_material_trimmed_with_notice() {
+fn g7a_overlong_must_keep_blocks_launch_with_required_and_limit() {
     let env = TestEnv::new();
-    // a goal larger than the 8 KiB budget is trimmed for launch, with an explicit
-    // truncation notice in the body (never silent); full change list stays in the workspace
+    // a goal larger than the 8 KiB budget is must-keep content: it is never
+    // trimmed silently — preview and approval return a blocking error carrying
+    // required/limit, and no attempt is ever launched (超额零启动)
     let huge_goal = "x".repeat(20 * 1024);
     let body = json!({
         "goal": huge_goal, "repo_path": env.user_repo.to_string_lossy(),
@@ -171,33 +172,44 @@ fn g7a_overlong_material_trimmed_with_notice() {
         .unwrap();
     env.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None)
         .unwrap();
-    let hash = env
-        .req("GET", &format!("/v1/tasks/{task_id}"), None, None)
-        .unwrap()["plan"]["summary_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    env.approve_current(&task_id, &hash).unwrap();
-    let resp = env
-        .req(
-            "POST",
-            &format!("/v1/tasks/{task_id}/dispatch"),
-            Some(&json!({})),
-            Some("big-2"),
-        )
-        .expect("trimmed launch allowed");
-    let attempt_id = resp["receipt"]["attempt_id"].as_str().unwrap().to_string();
-    let _ = env.run_until(&task_id, &["needs_review"], Duration::from_secs(60));
-    let captured = std::fs::read_to_string(capture_path(&env, &attempt_id)).unwrap();
+    // preview surfaces the blocking error with required/limit
+    let preview = env
+        .req("GET", &format!("/v1/tasks/{task_id}/handoff-preview"), None, None)
+        .unwrap_err();
+    assert_eq!(preview.0, 400, "preview blocked");
+    assert_eq!(preview.1["error"]["code"], json!("handoff_over_budget"));
+    let required = preview.1["error"]["details"]["required"].as_u64().unwrap();
+    let limit = preview.1["error"]["details"]["limit"].as_u64().unwrap();
+    assert_eq!(limit, 8 * 1024, "default dispatch budget");
+    assert!(required > limit, "required {required} exceeds limit {limit}");
     assert!(
-        captured.as_bytes().len() <= 8 * 1024,
-        "launched body respects the budget: {} bytes",
-        captured.as_bytes().len()
+        required > 20 * 1024,
+        "required covers the full goal ({required} bytes), not a trimmed fragment"
     );
+    // approval cannot bind an over-budget body (assembly fails before digest checks)
+    let hash = env.plan_hash(&task_id);
+    let rev = env.revision_of(&task_id);
+    let approve = env.req_with_if_match(
+        "POST",
+        &format!("/v1/tasks/{task_id}/plan/approve"),
+        Some(&json!({"summary_hash": hash, "handoff_digest": "0".repeat(64)})),
+        Some("big-approve"),
+        rev,
+    )
+    .unwrap_err();
+    assert_eq!(approve.0, 400, "approval blocked");
+    assert_eq!(approve.1["error"]["code"], json!("handoff_over_budget"));
+    // dispatch never launches
+    let _ = env.req(
+        "POST",
+        &format!("/v1/tasks/{task_id}/dispatch"),
+        Some(&json!({})),
+        Some("big-2"),
+    )
+    .unwrap_err();
+    let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
     assert!(
-        captured.contains("【蜂递】正文超出默认预算") || captured.contains("[wagglepost] Body exceeded"),
-        "truncation notice present, not silent"
+        snap["attempts"].as_array().unwrap().is_empty(),
+        "zero launch for over-budget must-keep content"
     );
-    // the reporting contract is never trimmed away
-    assert!(captured.contains("wagglepost-result"));
 }

@@ -253,6 +253,9 @@ fn core_error_response(e: &CoreError) -> Response {
     if let Some(r) = &e.reason {
         body["error"]["reason"] = json!(r);
     }
+    if let Some(d) = &e.details {
+        body["error"]["details"] = d.clone();
+    }
     (status, Json(body)).into_response()
 }
 

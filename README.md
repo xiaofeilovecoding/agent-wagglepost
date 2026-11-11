@@ -4,10 +4,54 @@
 
 WagglePost 0.2 是单二进制的本地工具：Rust core + SQLite + 内嵌 React 工作台（仅 `127.0.0.1`）+ 同二进制 CLI。路由与交接组装是本地确定性规则，不额外调用规划模型。
 
+## 一次真实换班（合成样例，零模型调用）
+
+写者配额阻塞后，换班包按字节预算组包：必保留字段（目标、验收、范围、已确认进度、失败位置、下一步）从不裁剪；剩余空间先放变更路径和检查结果，再放证据；装不下的可选条目整段省略并在账单中列明「本次省略」。下面是一次真实运行的换班正文（节选，完整输出可本地复现）：
+
+```text
+## 目标 / Goal
+在配额阻塞后从检查点换班继续，保持必保留内容完整。
+Resume from the checkpoint after the quota block with must-keep content intact.
+唯一结尾句：W3 证据链在此结束 ⏹ unique-ending-marker-9f2c
+
+## 已确认进度 / Confirmed progress
+上一写者已保存的改动文件：
+tracked-evidence-00.txt, tracked-evidence-01.txt, …（共 60 个，完整清单随包发送）
+
+## 失败位置 / Failure location
+simulated quota exhausted
+
+## 下一步 / Next step
+从检查点继续：先复核已改动内容，再补齐目标 / continue from the checkpoint: review the kept changes, then finish the goal
+
+## 汇报契约（必须遵守）
+结束时输出且只输出一个标记为 wagglepost-result 的围栏 JSON 块：…
+```
+
+同一运行的交接账单——完整候选正文与实际交付的对照：
+
+| 账单项 | 字节 |
+| --- | --- |
+| 必保留下限（必保留内容 + 标题 + 分隔 + 汇报契约 + 省略提示预留） | 3,062 |
+| 实际交付正文（必保留全部完整 + 可选材料 + 省略提示） | 4,566 |
+| 对照：本地构造的全量重讲载荷（仅对照，永不发送） | 5,743 |
+
+实际交付 4,566 字节 < 对照 5,743 字节；六个必保留字段全部完整送达，唯一结尾句原样保留在目标段末尾。数字由确定性测试 `tests/wp_evidence.rs` 产生（固定输入固定字节），本机重跑即得相同字节。
+
 ## 3 分钟无账号演示（全部模拟，零模型调用）
 
+**方式 A · 便携包（无需源码）**：每个 Windows CI run 都产出 `wagglepost-windows-x64-portable` 产物——ZIP 内含 `wagglepost.exe`、`LICENSE`、`SHA256SUMS.txt`，打包前已在源码树外完成启动冒烟。到 [Actions 页面](https://github.com/xiaofeilovecoding/agent-wagglepost/actions) 打开一个已完成的 run，在 Artifacts 区下载：
+
 ```powershell
-git clone <this-repository> agent-wagglepost
+# 解压到任意目录后，在该目录内：
+.\wagglepost.exe serve --managed-root $env:TEMP\wagglepost-demo
+# 控制台打印一次性启动码；浏览器打开它提示的 http://127.0.0.1:<port> 输入
+```
+
+**方式 B · 从源码构建**：
+
+```powershell
+git clone https://github.com/xiaofeilovecoding/agent-wagglepost.git agent-wagglepost
 cd agent-wagglepost\web
 npm ci
 npm run build
@@ -64,7 +108,7 @@ Key 只从环境读取，只转发给隔离的运行时进程；不写入回执�
 
 ## 交接账单与用量
 
-任务详情在派发/换轨/续答确认旁显示「将发送的范围」：实际生成的脱敏正文、包含项与排除原因、UTF-8 字节数、digest、工作树与候选短标识；digest 绑定该次实际发出的结构化交接，身份变化后旧确认失效。本地构造的对照载荷字节（同任务全量重讲的粗略基线）仅作对比展示、永不发送。token/缓存/费用只在提供方真实返回时展示并注明来源（如 `opencode step_finish.part.tokens`），未知留空；不为估算发起额外模型请求。
+任务详情在派发/换轨/续答确认旁显示「将发送的范围」：**必须发送**（必保留内容，按模式固定，从不裁剪）、**本次省略**（装不下的可选条目，整段省略并计数）、UTF-8 字节数与必保留下限、digest、工作树与候选短标识；digest 绑定该次实际发出的正文，换预算、任务版本或运行时身份后旧确认失效；必保留内容超限时预览直接返回 required/limit 并提示减少必保留内容或调高上限，派发零启动。本地构造的对照载荷字节（同任务全量重讲的粗略基线）仅作对比展示、永不发送。标题、编号、中文与 emoji 均按实际 UTF-8 字节计，边界不破坏字符。token/缓存/费用只在提供方真实返回时展示并注明来源（如 `opencode step_finish.part.tokens`），未知留空；不为估算发起额外模型请求。
 
 ## CLI
 
@@ -98,7 +142,7 @@ python -m playwright install chromium
 python scripts/run_ui_gates.py --exe target\release\wagglepost.exe --out ci-artifacts
 ```
 
-GitHub Actions 只有一个 Windows job：`windows-build-test-ui`。它使用 `npm ci`、`cargo --locked`，在临时受管根和随机回环端口启动生产 exe，运行真实 Chromium（15 项行为门禁），并核对服务端实际资产与 `web/dist/ASSETS.sha`。工作流仅 `contents: read`，触发为 `push` main 与 `pull_request`，不使用 `pull_request_target`，不接入秘密或模型；artifact 只含合成测试数据（截图与门禁 JSON）。
+GitHub Actions 只有一个 Windows job：`windows-build-test-ui`。它使用 `npm ci`、`cargo --locked`，在临时受管根和随机回环端口启动生产 exe，运行真实 Chromium（16 项行为门禁），核对服务端实际资产与 `web/dist/ASSETS.sha`，并打包 Windows x64 便携 ZIP（exe + LICENSE + SHA256SUMS，打包前在源码树外冒烟启动）。工作流仅 `contents: read`，触发为 `push` main 与 `pull_request`，不使用 `pull_request_target`，不接入秘密或模型；artifact 只含合成测试数据（截图、门禁 JSON 与便携包）。
 
 ## 安全边界
 

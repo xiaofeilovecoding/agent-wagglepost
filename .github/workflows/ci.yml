@@ -62,6 +62,9 @@ jobs:
       - name: Production browser and served-asset gate
         run: python scripts/run_ui_gates.py --exe target/release/wagglepost.exe --out ci-artifacts
 
+      - name: Build Windows x64 portable ZIP (exe + LICENSE + SHA256)
+        run: python scripts/make_portable.py --exe target/release/wagglepost.exe --out portable-dist
+
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,3 +72,10 @@ jobs:
           name: wagglepost-windows-ui
           path: ci-artifacts/
           if-no-files-found: warn
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wagglepost-windows-x64-portable
+          path: ci-artifacts/portable/
+          if-no-files-found: error

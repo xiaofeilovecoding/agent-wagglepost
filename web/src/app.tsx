@@ -405,37 +405,68 @@ function BillPanel({ lang, bill, identity }: { lang: Lang; bill: any; identity: 
     if (!r) return "";
     const zh: Record<string, string> = {
       empty: "空，未包含",
+      over_budget_omitted: "本次省略（超预算）",
       over_budget_trimmed: "超预算裁剪",
       over_budget_dropped: "超预算未发送",
     };
     const en: Record<string, string> = {
       empty: "empty; not included",
+      over_budget_omitted: "omitted this time (over budget)",
       over_budget_trimmed: "trimmed over budget",
       over_budget_dropped: "dropped over budget",
     };
     return lang === "zh" ? zh[r] || r : en[r] || r;
   };
+  const must = (bill.included || []).filter((s: any) => s.must);
+  const incl = (bill.included || []).filter((s: any) => !s.must);
   return (
     <div className="handoff-bill" data-testid="handoff-bill">
       <p className="bill-head">
         <strong>{lang === "zh" ? "将发送的范围" : "Scope to be sent"}</strong>{" "}
         {bill.bytes} {t("bytes", lang)} · {lang === "zh" ? "预算" : "budget"} {bill.budget_bytes} · digest{" "}
         <code>{String(bill.sha256).slice(0, 10)}</code>
-        {bill.truncated ? <span className="tag warn">{lang === "zh" ? "已裁剪" : "trimmed"}</span> : null}
+        {bill.truncated ? <span className="tag warn">{lang === "zh" ? "本次有省略" : "omissions this time"}</span> : null}
+      </p>
+      <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+        {lang === "zh" ? "必须发送（必保留，从不裁剪）" : "Must send (must-keep, never trimmed)"} ·{" "}
+        {lang === "zh" ? "下限" : "floor"} {bill.required_bytes} {t("bytes", lang)}
       </p>
       <ul className="bill-list">
-        {(bill.included || []).map((s: any) => (
+        {must.map((s: any) => (
+          <li key={"m" + s.title}>
+            <span className="tag">{lang === "zh" ? "必" : "must"}</span> {s.title} · {s.bytes} {t("bytes", lang)}
+          </li>
+        ))}
+        {incl.map((s: any) => (
           <li key={"i" + s.title}>
             <span className="tag">{lang === "zh" ? "含" : "incl"}</span> {s.title} · {s.bytes} {t("bytes", lang)}
             {s.reason ? <em className="muted"> ({reason(s.reason)})</em> : null}
           </li>
         ))}
-        {(bill.excluded || []).map((s: any) => (
-          <li key={"e" + s.title} className="muted">
-            <span className="tag">{lang === "zh" ? "排" : "excl"}</span> {s.title} — {reason(s.reason)}
-          </li>
-        ))}
       </ul>
+      {(bill.excluded || []).length > 0 && (
+        <>
+          <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            {lang === "zh" ? "本次省略" : "Omitted this time"}
+            {bill.omitted_count ? ` · ${bill.omitted_count}` : ""}
+          </p>
+          <ul className="bill-list">
+            {(bill.excluded || []).map((s: any) => (
+              <li key={"e" + s.title} className="muted">
+                <span className="tag">{lang === "zh" ? "省" : "omit"}</span> {s.title} · {s.bytes} {t("bytes", lang)} —{" "}
+                {reason(s.reason)}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {bill.truncated ? (
+        <p className="muted" style={{ fontSize: 12 }}>
+          {lang === "zh"
+            ? "预算内装不下全部可选材料：可减少必保留内容或调高上限后重新预览。"
+            : "Not everything fits the budget: reduce must-keep material or raise the limit, then re-preview."}
+        </p>
+      ) : null}
       <p className="muted" style={{ fontSize: 12 }}>
         {lang === "zh" ? "汇报契约" : "reporting contract"} {bill.footer_bytes} {t("bytes", lang)} ·{" "}
         {lang === "zh" ? "模式" : "mode"} {bill.mode}
@@ -454,6 +485,27 @@ function BillPanel({ lang, bill, identity }: { lang: Lang; bill: any; identity: 
         {lang === "zh"
           ? "digest 绑定本次实际发出的正文；任务身份或候选变化后需重新预览确认。"
           : "The digest binds this exact body; identity or candidate changes require a fresh preview."}
+      </p>
+    </div>
+  );
+}
+
+// W2: must-keep content over budget — the preview is blocked before anything
+// can be confirmed or launched; tell the user exactly which knob to turn.
+function OverBudgetHint({ lang, err }: { lang: Lang; err: any }) {
+  if (!err || err.code !== "handoff_over_budget") return null;
+  const d = err.details || {};
+  return (
+    <div className="handoff-bill" data-testid="handoff-over-budget" role="alert">
+      <p className="bill-head">
+        <span className="tag warn">{lang === "zh" ? "无法发送" : "Cannot send"}</span>{" "}
+        {lang === "zh" ? "必保留内容需要" : "Must-keep content needs"} {d.required} {t("bytes", lang)} ·{" "}
+        {lang === "zh" ? "上限" : "limit"} {d.limit} {t("bytes", lang)}
+      </p>
+      <p className="muted" style={{ fontSize: 12 }}>
+        {lang === "zh"
+          ? "必保留内容（目标、验收、范围、进度等）从不裁剪。请减少必保留内容或调高上限后重新预览。"
+          : "Must-keep content (goal, acceptance, scope, progress) is never trimmed. Reduce it or raise the limit, then re-preview."}
       </p>
     </div>
   );
@@ -1010,6 +1062,7 @@ function TaskView({
   const [resumePreview, setResumePreview] = useState<any>(null);
   const [approvalPreview, setApprovalPreview] = useState<any>(null);
   const [handoff, setHandoff] = useState<any>(null);
+  const [handoffErr, setHandoffErr] = useState<any>(null);
   const [diff, setDiff] = useState<any>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [requestInfo, setRequestInfo] = useState<any>(null);
@@ -1019,7 +1072,12 @@ function TaskView({
     const task = snap.task;
     const status = task.status;
     if (["awaiting_approval", "queued"].includes(status) && snap.plan) {
-      api.handoffPreview(task.task_id, "writer").then(setHandoff).catch(() => setHandoff(null));
+      api.handoffPreview(task.task_id, "writer")
+        .then((p) => { setHandoff(p); setHandoffErr(null); })
+        .catch((e) => {
+          setHandoff(null);
+          setHandoffErr(e instanceof ApiError ? e : null);
+        });
     }
   }, [snap?.task?.status, snap?.task?.task_id]);
 
@@ -1318,6 +1376,9 @@ function TaskView({
               </p>
             </details>
           )}
+          {status === "awaiting_approval" && !handoff && (
+            <OverBudgetHint lang={lang} err={handoffErr} />
+          )}
           {handoff && ["awaiting_approval"].includes(status) && (
             <details>
               <summary>
@@ -1402,6 +1463,7 @@ function TaskView({
 function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask, refreshTasks }: any) {
   const [resume, setResume] = useState<any>(null);
   const [handoff, setHandoff] = useState<any>(null);
+  const [handoffErr, setHandoffErr] = useState<any>(null);
   const [targets, setTargets] = useState<any[]>([]);
   // WP11: per-target two-step confirm — click shows the exact body; the confirm
   // click submits THAT digest; changing target clears the pending confirmation
@@ -1409,7 +1471,9 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
   useEffect(() => {
     api.resumeOptions(task.task_id).then(setResume).catch(() => {});
     api.routePreview(task.task_id, "writer").then((r) => setTargets(r.candidates || [])).catch(() => {});
-    api.handoffPreview(task.task_id, "writer").then(setHandoff).catch(() => {});
+    api.handoffPreview(task.task_id, "writer")
+      .then((p) => { setHandoff(p); setHandoffErr(null); })
+      .catch((e) => setHandoffErr(e instanceof ApiError ? e : null));
   }, [task.task_id]);
   const cp = (snap.checkpoints || [])[0];
   const eligible = targets.filter((c) => c.ok && !c.simulated);
@@ -1433,6 +1497,7 @@ function ReroutePanel({ lang, task, snap, busy, setBusy, showToast, refreshTask,
               : "Same session unconfirmed: a full compact package needs preview + approval."}
         </p>
       )}
+      {!handoff && <OverBudgetHint lang={lang} err={handoffErr} />}
       {handoff && (
         <details open={!!pending}>
           <summary>

@@ -4,10 +4,54 @@
 
 WagglePost 0.2 is a single local binary: Rust core + SQLite + an embedded React workbench on `127.0.0.1` + a CLI in the same binary. Routing and handoff assembly use deterministic local rules and make no extra planning-model calls.
 
+## One real relay handoff (synthetic sample, zero model calls)
+
+After a writer's quota block, the relay package is assembled under a byte budget: must-keep fields (goal, acceptance, scope, confirmed progress, failure location, next step) are never trimmed; remaining space first carries change paths and check results, then evidence; optional entries that do not fit are omitted whole and listed on the bill as "omitted this time". Below is the relay body from one real run (excerpt, fully reproducible locally):
+
+```text
+## 目标 / Goal
+在配额阻塞后从检查点换班继续，保持必保留内容完整。
+Resume from the checkpoint after the quota block with must-keep content intact.
+唯一结尾句：W3 证据链在此结束 ⏹ unique-ending-marker-9f2c
+
+## 已确认进度 / Confirmed progress
+上一写者已保存的改动文件：
+tracked-evidence-00.txt, tracked-evidence-01.txt, … (60 files, full list rides with the package)
+
+## 失败位置 / Failure location
+simulated quota exhausted
+
+## 下一步 / Next step
+从检查点继续：先复核已改动内容，再补齐目标 / continue from the checkpoint: review the kept changes, then finish the goal
+
+## 汇报契约（必须遵守）
+结束时输出且只输出一个标记为 wagglepost-result 的围栏 JSON 块：…
+```
+
+The handoff bill from the same run — the full candidate body versus what is actually delivered:
+
+| Bill item | Bytes |
+| --- | --- |
+| Must-keep floor (must-keep content + titles + separators + reporting contract + notice reserve) | 3,062 |
+| Actually delivered body (all must-keep complete + optional material + omission notice) | 4,566 |
+| Comparison: locally constructed naive full re-brief (reference only, never sent) | 5,743 |
+
+Delivered 4,566 bytes < comparison 5,743 bytes; all six must-keep fields arrive complete and the unique ending sentence survives verbatim at the end of the goal section. The numbers come from the deterministic test `tests/wp_evidence.rs` (fixed input → fixed bytes); rerun it locally for the same numbers.
+
 ## 3-minute demo with no account (fully simulated, zero model calls)
 
+**Option A · portable package (no source tree needed)**: every Windows CI run produces a `wagglepost-windows-x64-portable` artifact — a ZIP with `wagglepost.exe`, `LICENSE` and `SHA256SUMS.txt`, smoke-started outside the source tree before packaging. Open a completed run on the [Actions page](https://github.com/xiaofeilovecoding/agent-wagglepost/actions) and download it from the Artifacts section:
+
 ```powershell
-git clone <this-repository> agent-wagglepost
+# after extracting to any directory, from that directory:
+.\wagglepost.exe serve --managed-root $env:TEMP\wagglepost-demo
+# the console prints a one-time startup code; open the http://127.0.0.1:<port> it prints
+```
+
+**Option B · build from source**:
+
+```powershell
+git clone https://github.com/xiaofeilovecoding/agent-wagglepost.git agent-wagglepost
 cd agent-wagglepost\web
 npm ci
 npm run build
@@ -64,7 +108,7 @@ Keys are read from the environment only and forwarded only to the isolated runti
 
 ## Handoff bill and usage
 
-Next to every dispatch/reroute/answer confirmation the task detail shows the "scope to be sent": the actual redacted body, included sections and exclusion reasons, UTF-8 byte counts, the digest, and the worktree/candidate identity; the digest binds the exact structured handoff that will be sent, and identity changes invalidate old confirmations. A locally constructed comparison payload (a naive full re-brief of the same task) is shown for scale, clearly labeled, and never sent. Tokens/cache/cost are displayed only when the provider actually returned them, with the source named (e.g. `opencode step_finish.part.tokens`); unknown stays empty, and no extra model requests are made for estimates.
+Next to every dispatch/reroute/answer confirmation the task detail shows the "scope to be sent": **must send** (must-keep content, fixed per mode, never trimmed), **omitted this time** (optional entries that do not fit, omitted whole and counted), UTF-8 byte counts and the must-keep floor, the digest, and the worktree/candidate identity. The digest binds the exact body that will be sent; changing the budget, the task version or the runtime identity invalidates old confirmations. When must-keep content exceeds the limit, the preview returns required/limit and asks you to reduce must-keep material or raise the limit — dispatch never launches. A locally constructed comparison payload (a naive full re-brief of the same task) is shown for scale, clearly labeled, and never sent. Titles, numbering, CJK and emoji all count their real UTF-8 bytes; boundaries never split a character. Tokens/cache/cost are displayed only when the provider actually returned them, with the source named (e.g. `opencode step_finish.part.tokens`); unknown stays empty, and no extra model requests are made for estimates.
 
 ## CLI
 
@@ -98,7 +142,7 @@ python -m playwright install chromium
 python scripts/run_ui_gates.py --exe target\release\wagglepost.exe --out ci-artifacts
 ```
 
-GitHub Actions runs a single Windows job, `windows-build-test-ui`: `npm ci`, `cargo --locked`, the production exe on a temp managed root and a random loopback port, real Chromium (15 behavioral gates), and a check that the served assets match `web/dist/ASSETS.sha`. The workflow uses `contents: read` only, triggers on `push` main and `pull_request`, never `pull_request_target`, and touches no secrets or models; artifacts contain synthetic test data only (screenshots and gate JSON).
+GitHub Actions runs a single Windows job, `windows-build-test-ui`: `npm ci`, `cargo --locked`, the production exe on a temp managed root and a random loopback port, real Chromium (16 behavioral gates), a check that the served assets match `web/dist/ASSETS.sha`, and packaging of the Windows x64 portable ZIP (exe + LICENSE + SHA256SUMS, smoke-started outside the source tree before packaging). The workflow uses `contents: read` only, triggers on `push` main and `pull_request`, never `pull_request_target`, and touches no secrets or models; artifacts contain synthetic test data only (screenshots, gate JSON and the portable package).
 
 ## Security boundaries
 

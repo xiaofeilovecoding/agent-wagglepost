@@ -206,6 +206,8 @@ pub struct CoreError {
     pub code: String,
     pub message: String,
     pub reason: Option<routing::Reason>,
+    /// structured fields for machine-readable error handling (e.g. required/limit)
+    pub details: Option<serde_json::Value>,
 }
 
 impl CoreError {
@@ -215,6 +217,7 @@ impl CoreError {
             code: code.into(),
             message: msg.into(),
             reason: None,
+            details: None,
         }
     }
     pub fn conflict(code: &str, msg: impl Into<String>) -> Self {
@@ -223,6 +226,7 @@ impl CoreError {
             code: code.into(),
             message: msg.into(),
             reason: None,
+            details: None,
         }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
@@ -231,6 +235,7 @@ impl CoreError {
             code: "not_found".into(),
             message: msg.into(),
             reason: None,
+            details: None,
         }
     }
     pub fn busy(code: &str, msg: impl Into<String>) -> Self {
@@ -239,6 +244,7 @@ impl CoreError {
             code: code.into(),
             message: msg.into(),
             reason: None,
+            details: None,
         }
     }
 }
@@ -250,6 +256,7 @@ impl From<String> for CoreError {
             code: "internal".into(),
             message: e,
             reason: None,
+            details: None,
         }
     }
 }
@@ -1818,8 +1825,22 @@ failure_location: cp
             (Role::Writer, _) => HandoffMode::FirstRun,
             (Role::Reviewer, _) => HandoffMode::Review,
         };
-        handoff::assemble(mode, task, parts, lang, self.cfg.default_body_budget)
-            .map_err(|e| CoreError::bad("handoff_error", e))
+        handoff::assemble(mode, task, parts, lang, self.cfg.default_body_budget).map_err(|e| {
+            match e {
+                handoff::HandoffError::OverBudget { required, limit } => CoreError {
+                    status: 400,
+                    code: "handoff_over_budget".into(),
+                    message: format!(
+                        "handoff must-keep content requires {required} bytes but the dispatch budget is {limit} bytes; reduce must-keep material or raise the dispatch limit"
+                    ),
+                    reason: None,
+                    details: Some(serde_json::json!({
+                        "required": required, "limit": limit,
+                        "hint": "reduce must-keep material or raise the dispatch limit"
+                    })),
+                },
+            }
+        })
     }
 
     /// H1/H2 bootstrap: offline, no-account contract verification (WP22).
