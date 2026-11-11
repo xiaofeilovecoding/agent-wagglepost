@@ -275,91 +275,128 @@ pub fn assemble(
     } else {
         TRUNCATED_NOTICE_ZH
     };
-    // The notice is part of the delivered bytes whenever optional material
-    // exists (omission is then possible), so it is reserved up front — never
-    // appended after the budget check.
-    let has_optional = sections
-        .iter()
-        .any(|(id, _)| id.tier(mode) != Tier::MustKeep)
-        || !refs.is_empty();
-    let notice_bytes = if has_optional { notice.as_bytes().len() + 2 } else { 0 };
+    let notice_cost = notice.as_bytes().len() + 2; // notice + blank line before the body
 
-    // ---- 2. must-keep floor: full content + titles + separators + contract ----
+    // ---- 2. must-keep floor: full must-keep body + result contract ----
     let must: Vec<(SectionId, String)> = sections
         .iter()
         .filter(|(id, _)| id.tier(mode) == Tier::MustKeep)
         .cloned()
         .collect();
     let must_bytes = render_text(&must).as_bytes().len();
-    let required = must_bytes + footer_bytes + notice_bytes;
-    if required > budget {
-        return Err(HandoffError::OverBudget { required, limit: budget });
+    let floor = must_bytes + footer_bytes;
+    if floor > budget {
+        return Err(HandoffError::OverBudget { required: floor, limit: budget });
     }
-    let mut remaining = budget - required;
 
-    // ---- 3. fit optional sections whole: change paths / check results first,
-    //         then evidence; skip what does not fit, keep trying shorter ones ----
-    let mut cur: Vec<(SectionId, String)> = must.clone();
-    let mut omitted_count: usize = 0;
-    let mut included: Vec<SectionId> = Vec::new();
-    let mut excluded: Vec<BillSection> = Vec::new();
-    let optional: Vec<(SectionId, String)> = sections
-        .iter()
-        .filter(|(id, _)| id.tier(mode) != Tier::MustKeep)
-        .cloned()
-        .collect();
-    for tier in [Tier::First, Tier::Then] {
-        for (id, body) in optional.iter() {
-            if id.tier(mode) != tier {
-                continue;
+    // ---- 3. one deterministic selection pass over optionals + references ----
+    // Sections are kept or omitted whole; references have definite item
+    // boundaries and are fitted one by one into a SINGLE refs section that is
+    // only attached at the end, so repeated fitting never duplicates titles or
+    // references and the space they use is counted exactly once.
+    #[derive(Default)]
+    struct Selection {
+        cur: Vec<(SectionId, String)>,
+        included: Vec<SectionId>,
+        excluded: Vec<BillSection>,
+        omitted_count: usize,
+        refs_selected: Vec<String>,
+        refs_omitted_count: usize,
+        refs_omitted_bytes: usize,
+    }
+    let fit = |mut remaining: usize| -> Selection {
+        let mut sel = Selection { cur: must.clone(), ..Default::default() };
+        let optional: Vec<(SectionId, String)> = sections
+            .iter()
+            .filter(|(id, _)| id.tier(mode) != Tier::MustKeep)
+            .cloned()
+            .collect();
+        for tier in [Tier::First, Tier::Then] {
+            for (id, body) in optional.iter() {
+                if id.tier(mode) != tier {
+                    continue;
+                }
+                let mut cand = sel.cur.clone();
+                cand.push((*id, body.clone()));
+                let delta =
+                    render_text(&cand).as_bytes().len() - render_text(&sel.cur).as_bytes().len();
+                if delta <= remaining {
+                    sel.cur = cand;
+                    sel.included.push(*id);
+                } else {
+                    sel.omitted_count += 1;
+                    sel.excluded.push(BillSection {
+                        title: id.title(),
+                        bytes: body.as_bytes().len(),
+                        reason: Some("over_budget_omitted".into()),
+                        must: false,
+                    });
+                }
             }
-            let mut cand = cur.clone();
-            cand.push((*id, body.clone()));
-            let delta = render_text(&cand).as_bytes().len() - render_text(&cur).as_bytes().len();
+        }
+        // references: one growing section, cost measured against the sectionless base
+        let base_bytes = render_text(&sel.cur).as_bytes().len();
+        let mut refs_cost = 0usize;
+        for r in refs {
+            let mut lines = sel.refs_selected.clone();
+            lines.push(r.clone());
+            let body = lines
+                .iter()
+                .map(|d| format!("- {d}\n"))
+                .collect::<String>();
+            let mut cand = sel.cur.clone();
+            cand.push((SectionId::EvidenceRefs, body));
+            let total = render_text(&cand).as_bytes().len() - base_bytes;
+            let delta = total - refs_cost;
             if delta <= remaining {
                 remaining -= delta;
-                cur = cand;
-                included.push(*id);
+                refs_cost = total;
+                sel.refs_selected.push(r.clone());
             } else {
-                omitted_count += 1;
-                excluded.push(BillSection {
-                    title: id.title(),
-                    bytes: body.as_bytes().len(),
-                    reason: Some("over_budget_omitted".into()),
-                    must: false,
-                });
+                sel.omitted_count += 1;
+                sel.refs_omitted_count += 1;
+                sel.refs_omitted_bytes += r.as_bytes().len();
             }
         }
-    }
-
-    // ---- 4. evidence references: definite item boundaries, fitted one by one ----
-    let mut delivered_refs: Vec<String> = Vec::new();
-    for r in refs {
-        let cand_body = delivered_refs
-            .iter()
-            .map(|d| format!("- {d}\n"))
-            .collect::<String>()
-            + &format!("- {r}\n");
-        let mut cand = cur.clone();
-        cand.push((SectionId::EvidenceRefs, cand_body.clone()));
-        let delta = render_text(&cand).as_bytes().len() - render_text(&cur).as_bytes().len();
-        if delta <= remaining {
-            remaining -= delta;
-            cur = cand;
-            delivered_refs.push(r.clone());
-        } else {
-            omitted_count += 1;
+        if !sel.refs_selected.is_empty() {
+            let body = sel
+                .refs_selected
+                .iter()
+                .map(|d| format!("- {d}\n"))
+                .collect::<String>();
+            sel.cur.push((SectionId::EvidenceRefs, body));
         }
-    }
-    let refs_omitted = refs.len().saturating_sub(delivered_refs.len());
+        sel
+    };
+
+    // Pass A fits everything into the plain floor headroom. When material had
+    // to be omitted, the notice is counted on demand: refit with the notice
+    // reserved if it can still fit alongside the must-keep floor; if the
+    // notice itself cannot fit, the delivered body ships without it and the
+    // bill still discloses every omission.
+    let pass_a = fit(budget - floor);
+    let (selection, notice_used) = if pass_a.omitted_count == 0 {
+        (pass_a, false)
+    } else if floor + notice_cost <= budget {
+        let pass_b = fit(budget - floor - notice_cost);
+        (pass_b, true)
+    } else {
+        (pass_a, false)
+    };
+    let Selection {
+        cur,
+        included: _,
+        mut excluded,
+        omitted_count,
+        refs_selected: delivered_refs,
+        refs_omitted_count: refs_omitted,
+        refs_omitted_bytes,
+    } = selection;
+    let has_omissions = omitted_count > 0;
     if refs_omitted > 0 {
         excluded.push(BillSection {
             title: SectionId::EvidenceRefs.title(),
-            bytes: refs
-                .iter()
-                .skip(delivered_refs.len())
-                .map(|r| r.as_bytes().len())
-                .sum(),
+            bytes: refs_omitted_bytes,
             reason: Some("over_budget_omitted".into()),
             must: false,
         });
@@ -367,8 +404,8 @@ pub fn assemble(
 
     // ---- 5. render: must-keep first (display order), then fitted optional ----
     let text = render_text(&cur);
-    let truncated = omitted_count > 0;
-    let delivered_text = if truncated {
+    let truncated = has_omissions;
+    let delivered_text = if truncated && notice_used {
         format!("{notice}\n\n{text}{footer}")
     } else {
         format!("{text}{footer}")
@@ -410,7 +447,7 @@ pub fn assemble(
         excluded,
         footer_bytes,
         comparison_bytes: None,
-        required_bytes: required,
+        required_bytes: floor,
         omitted_count,
         refs_included: delivered_refs.len(),
         refs_omitted,

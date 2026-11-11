@@ -36,7 +36,9 @@ The handoff bill from the same run — the full candidate body versus what is ac
 | Actually delivered body (all must-keep complete + optional material + omission notice) | 4,566 |
 | Comparison: locally constructed naive full re-brief (reference only, never sent) | 5,743 |
 
-Delivered 4,566 bytes < comparison 5,743 bytes; all six must-keep fields arrive complete and the unique ending sentence survives verbatim at the end of the goal section. The numbers come from the deterministic test `tests/wp_evidence.rs` (fixed input → fixed bytes); rerun it locally for the same numbers.
+Delivered 4,566 bytes < comparison 5,743 bytes; all six must-keep fields arrive complete and the unique ending sentence survives verbatim at the end of the goal section. This is the everything-fits scenario; the numbers come from the deterministic test `tests/wp_evidence.rs` (fixed input → fixed bytes); rerun it locally for the same numbers.
+
+The really-omitted scenario comes from the same real dispatch path (the reviewer handoff, where the writer touched 300 files and the change-path list exceeded the budget and was omitted whole): must-keep floor 1,258 bytes, delivered 1,521 bytes, comparison 97,779 bytes, 1 item omitted with the omission notice; the bilingual acceptance and the unique ending sentence still arrive complete. Both scenarios are real runs of `tests/wp_evidence.rs`, labeled as such here.
 
 ## 3-minute demo with no account (fully simulated, zero model calls)
 

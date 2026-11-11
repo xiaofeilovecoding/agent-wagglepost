@@ -229,3 +229,139 @@ fn w3_quota_block_confirm_relay_review_accept_with_bill_evidence() {
     assert_eq!(final_snap["task"]["status"], json!("accepted"), "journey complete");
     assert_eq!(final_snap["task"]["accepted_candidate_hash"], json!(cand_hash));
 }
+
+/// W2: a PRODUCTION-path run where long optional evidence is really omitted —
+/// the writer modifies 300 tracked files, so the reviewer's change-path list
+/// exceeds the budget, is omitted whole, and the must-keep fields (including
+/// the bilingual acceptance and the unique ending sentence) still arrive
+/// complete with the exact delivered bytes on the bill.
+#[test]
+fn w2_reviewer_production_path_omits_long_optional_evidence() {
+    let env = TestEnv::new();
+    // seed 300 tracked files so the change-path list exceeds the 8 KiB budget
+    for i in 0..300 {
+        std::fs::write(
+            env.user_repo.join(format!("tracked-evidence-{i:03}.txt")),
+            "baseline (tracked)
+",
+        )
+        .unwrap();
+    }
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed 300 files"],
+    ] {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&env.user_repo)
+            .status()
+            .expect("git");
+        assert!(st.success(), "git seed failed");
+    }
+    let goal = "复核场景：长可选证据被整段省略。
+Review scenario: long optional evidence is omitted whole.";
+    let acceptance = "- 必保留字段完整送达（目标/验收/范围/进度/失败位置/下一步）
+                      - Must-keep fields arrive complete (goal/acceptance/scope/progress/failure/next)
+                      - 超预算的可选材料整段省略 / oversized optional material omitted whole
+                      - 唯一结尾句：W2 省略场景在此结束 ⏹ unique-ending-w2-omitted";
+    let resp = env
+        .req(
+            "POST",
+            "/v1/tasks",
+            Some(&json!({
+                "goal": goal,
+                "acceptance": acceptance.lines().collect::<Vec<_>>(),
+                "repo_path": env.user_repo.to_string_lossy(),
+                "recipe": "write_then_review",
+                "allowed_adapters": ["fake"],
+            })),
+            Some("w2-submit"),
+        )
+        .unwrap();
+    let task_id = resp["task"]["task_id"].as_str().unwrap().to_string();
+    env.req("POST", &format!("/v1/tasks/{task_id}/trust"), Some(&json!({})), None).unwrap();
+    env.req("POST", &format!("/v1/tasks/{task_id}/plan"), Some(&json!({})), None).unwrap();
+    env.core.store.meta_set(
+        &format!("fake_script:{task_id}:s1"),
+        &json!({
+            "behaviors": ["write_files"],
+            "files": (0..300)
+                .map(|i| (format!("tracked-evidence-{i:03}.txt"), json!("updated by the writer (simulated)
+")))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "result": {"status": "done", "summary": "writer done (simulated)"}
+        })
+        .to_string(),
+    );
+    let hash = env.plan_hash(&task_id);
+    env.approve_current(&task_id, &hash).unwrap();
+    env.req("POST", &format!("/v1/tasks/{task_id}/dispatch"), Some(&json!({})), Some("w2-1"))
+        .unwrap();
+    let _ = env.run_until(&task_id, &["needs_review"], Duration::from_secs(90));
+
+    // reviewer preview on the production path: long optional evidence omitted
+    let review_preview = env
+        .req("GET", &format!("/v1/tasks/{task_id}/handoff-preview?role=reviewer"), None, None)
+        .unwrap();
+    let body = review_preview["handoff"]["text"].as_str().unwrap();
+    let bill = &review_preview["bill"];
+    assert_eq!(review_preview["handoff"]["mode"], json!("review"));
+    assert!(bill["omitted_count"].as_u64().unwrap() >= 1, "long optional omitted");
+    assert_eq!(bill["truncated"], json!(true));
+    // must-keep fields complete, including the bilingual acceptance and the
+    // unique ending sentence
+    for marker in ["## 复核问题 / Review questions
+", "## 验收条件 / Acceptance
+", "## 候选身份 / Candidate identity
+"] {
+        assert!(body.contains(marker), "review must-keep present: {marker}");
+    }
+    assert!(body.contains("唯一结尾句：W2 省略场景在此结束 ⏹ unique-ending-w2-omitted"));
+    assert!(body.contains("- 必保留字段完整送达（目标/验收/范围/进度/失败位置/下一步）"));
+    assert!(body.contains("Must-keep fields arrive complete"));
+    // the oversized change paths are NOT in the delivered body; the notice is
+    assert!(!body.contains("tracked-evidence-299.txt"), "omitted optional stays out");
+    assert!(body.contains("【蜂递】正文超出预算"), "omission notice present");
+    // floor reflects must-keep body + contract; delivered bytes within budget
+    let delivered = review_preview["handoff"]["bytes"].as_u64().unwrap();
+    let floor = bill["required_bytes"].as_u64().unwrap();
+    assert!(delivered <= 8 * 1024);
+    assert!(floor <= delivered);
+    assert!(bill["refs_included"].as_u64().unwrap() >= 1, "candidate evidence reference delivered");
+    eprintln!(
+        "W2-EVIDENCE delivered_bytes={delivered} floor_bytes={floor} omitted={} comparison={}",
+        bill["omitted_count"], bill["comparison_bytes"]
+    );
+
+    // transfer == preview on the reviewer attempt
+    let start = std::time::Instant::now();
+    let snap = loop {
+        let _ = env.req("POST", "/v1/__tick", Some(&json!({})), None);
+        let s = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
+        if !s["reviews"].as_array().unwrap().is_empty() {
+            break s;
+        }
+        if start.elapsed() > Duration::from_secs(90) {
+            panic!("review never recorded");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let reviewer_attempt = snap["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["role"] == json!("reviewer"))
+        .expect("reviewer attempt");
+    let captured = std::fs::read_to_string(
+        env.managed_root
+            .join("fake-captures")
+            .join(format!("{}.stdin.txt", reviewer_attempt["attempt_id"].as_str().unwrap())),
+    )
+    .expect("reviewer capture exists");
+    assert_eq!(
+        wagglepost::ids::sha256_hex(captured.as_bytes()),
+        review_preview["approved_digest"],
+        "reviewer received exactly the previewed (omission-applied) body"
+    );
+    assert!(!captured.contains("tracked-evidence-299.txt"));
+}

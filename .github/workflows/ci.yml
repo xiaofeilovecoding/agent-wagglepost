@@ -73,9 +73,11 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
-      - name: Upload portable ZIP
+      - name: Upload portable ZIP and checksum
         uses: actions/upload-artifact@v4
         with:
           name: wagglepost-windows-x64-portable
-          path: ci-artifacts/portable/
+          path: |
+            portable-dist/*.zip
+            portable-dist/*.sha256
           if-no-files-found: error

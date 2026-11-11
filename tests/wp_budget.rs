@@ -117,9 +117,10 @@ fn budget_skip_non_fitting_item_then_fit_shorter_ones() {
     };
     let roomy = handoff::assemble(HandoffMode::RelayPackage, &t, parts.clone(), "zh", 8 * 1024).unwrap();
     assert_eq!(roomy.bill.omitted_count, 0, "everything fits under 8 KiB");
-    // tight budget: must-keep + notice reserve + a little headroom — the big
-    // section is skipped and the two shorter ones still ride along
-    let tight_budget = roomy.bill.required_bytes + 160;
+    // tight budget: must-keep floor + enough headroom for the notice reserve
+    // and the two short sections — the big section is skipped and the shorter
+    // ones still ride along
+    let tight_budget = roomy.bill.required_bytes + 400;
     let tight = handoff::assemble(HandoffMode::RelayPackage, &t, parts, "zh", tight_budget).unwrap();
     assert!(tight.body.text.contains("checks ok ✅"), "shorter item after a skip still fits");
     assert!(tight.body.text.contains("evidence note ✓"), "later tier item still fits");
@@ -193,6 +194,7 @@ fn budget_hidden_references_cannot_smuggle_omitted_content() {
     assert!(roomy.body.evidence_refs.contains(&"evidence://task/t_budget/candidate/abcdef12".into()));
     assert!(roomy.body.text.contains("evidence://task/t_budget/candidate/abcdef12"));
 
+    // leave less room than the references block needs (floor + a few bytes)
     let tight_budget = roomy.bill.required_bytes + 16;
     let tight = handoff::assemble(HandoffMode::Review, &t, parts, "zh", tight_budget).unwrap();
     assert_eq!(tight.bill.refs_omitted, 1, "reference omitted with the budget");
@@ -310,4 +312,133 @@ fn budget_relay_digest_changes_when_material_changes() {
     assert_eq!(err.1["error"]["code"], json!("handoff_digest_mismatch"));
     let snap = env.req("GET", &format!("/v1/tasks/{task_id}"), None, None).unwrap();
     assert_eq!(snap["task"]["launches_used"], json!(0), "nothing launched");
+}
+
+#[test]
+fn budget_multiple_short_references_one_section_no_duplicates() {
+    let t = task();
+    // three short references that all fit: ONE section, every reference once
+    let parts = HandoffParts {
+        acceptance: "a".into(),
+        review_questions: "q".into(),
+        candidate_identity: "cid".into(),
+        unresolved: Some("u".into()),
+        evidence_refs: vec![
+            "evidence://task/t_budget/candidate/aaa11111".into(),
+            "evidence://task/t_budget/candidate/bbb22222".into(),
+            "evidence://task/t_budget/candidate/ccc33333".into(),
+        ],
+        ..Default::default()
+    };
+    let a = handoff::assemble(HandoffMode::Review, &t, parts.clone(), "zh", 8 * 1024).unwrap();
+    assert_eq!(a.bill.refs_included, 3);
+    assert_eq!(a.bill.refs_omitted, 0);
+    let occurrences = a.body.text.matches("证据索引 / Evidence index").count();
+    assert_eq!(occurrences, 1, "exactly one references section");
+    for r in ["aaa11111", "bbb22222", "ccc33333"] {
+        assert_eq!(a.body.text.matches(r).count(), 1, "reference {r} delivered once");
+    }
+    assert_eq!(a.body.evidence_refs.len(), 3, "adapter receives all three");
+    assert_eq!(a.bill.omitted_count, 0);
+    // determinism: the same selection renders byte-identically
+    let b = handoff::assemble(HandoffMode::Review, &t, parts, "zh", 8 * 1024).unwrap();
+    assert_eq!(a.body.sha256, b.body.sha256);
+    assert_eq!(a.body.bytes, b.body.bytes);
+}
+
+#[test]
+fn budget_long_reference_omitted_then_shorter_ones_ride() {
+    let t = task();
+    let long_ref = format!("evidence://task/t_budget/candidate/{}", "d".repeat(400));
+    let parts = HandoffParts {
+        acceptance: "a".into(),
+        review_questions: "q".into(),
+        candidate_identity: "cid".into(),
+        unresolved: Some("u".into()),
+        evidence_refs: vec![
+            long_ref,
+            "evidence://task/t_budget/candidate/short1".into(),
+            "evidence://task/t_budget/candidate/short2".into(),
+        ],
+        ..Default::default()
+    };
+    let roomy = handoff::assemble(HandoffMode::Review, &t, parts.clone(), "zh", 8 * 1024).unwrap();
+    assert_eq!(roomy.bill.refs_included, 3);
+    // tight budget: floor + room for the notice reserve and the two short
+    // references — the long reference is skipped first, the short ones ride
+    let tight_budget = roomy.bill.required_bytes + 340;
+    let tight = handoff::assemble(HandoffMode::Review, &t, parts, "zh", tight_budget).unwrap();
+    assert_eq!(tight.bill.refs_included, 2, "shorter references ride after the skip");
+    assert_eq!(tight.bill.refs_omitted, 1);
+    assert!(tight.body.text.contains("short1"));
+    assert!(tight.body.text.contains("short2"));
+    assert!(!tight.body.text.contains(&"d".repeat(400)));
+    // omitted bytes on the bill match the skipped reference exactly
+    let omitted_entry = tight
+        .bill
+        .excluded
+        .iter()
+        .find(|s| s.title == "证据索引 / Evidence index")
+        .expect("omitted references listed on the bill");
+    assert_eq!(omitted_entry.bytes, 400 + "evidence://task/t_budget/candidate/".len());
+    assert!(tight.bill.bytes <= tight_budget);
+}
+
+#[test]
+fn budget_chinese_reference_exact_boundary() {
+    let t = task();
+    // CJK reference: 3 bytes per char; the section must land byte-exactly on
+    // the remaining budget when it fits, and one byte under must refuse it
+    // (never split a character)
+    let zh_ref = "证据://任务/t_budget/候选/哈希值".to_string();
+    let parts = HandoffParts {
+        acceptance: "a".into(),
+        review_questions: "q".into(),
+        candidate_identity: "cid".into(),
+        unresolved: Some("u".into()),
+        evidence_refs: vec![zh_ref.clone()],
+        ..Default::default()
+    };
+    let roomy = handoff::assemble(HandoffMode::Review, &t, parts.clone(), "zh", 8 * 1024).unwrap();
+    assert_eq!(roomy.bill.refs_included, 1);
+    assert!(roomy.body.text.contains(&zh_ref), "CJK reference delivered intact");
+    // the delivered body accounts the CJK bytes exactly
+    let exact_budget = roomy.bill.bytes;
+    let exact = handoff::assemble(HandoffMode::Review, &t, parts.clone(), "zh", exact_budget).unwrap();
+    assert_eq!(exact.body.bytes, exact_budget, "CJK boundary lands byte-exactly");
+    assert_eq!(exact.bill.refs_included, 1);
+    // one byte under: the reference cannot fit and the omission notice cannot
+    // fit either — the body ships whole (must-keep + contract only) without a
+    // notice, while the bill discloses the omitted reference
+    let one_under = handoff::assemble(HandoffMode::Review, &t, parts, "zh", exact_budget - 1).unwrap();
+    assert_eq!(one_under.bill.refs_included, 0);
+    assert_eq!(one_under.bill.refs_omitted, 1);
+    assert!(one_under.bill.truncated);
+    assert!(!one_under.body.text.contains(&zh_ref));
+    assert!(!one_under.body.text.contains("【蜂递】"), "notice only ships when it fits");
+}
+
+#[test]
+fn budget_required_floor_is_must_keep_body_plus_contract() {
+    let t = task();
+    // no optional material: the floor is the must-keep body + the contract,
+    // and the exact-fit assembly lands on it
+    let parts = first_run_parts();
+    let a = handoff::assemble(HandoffMode::FirstRun, &t, parts.clone(), "zh", 8 * 1024).unwrap();
+    assert_eq!(a.bill.required_bytes, a.bill.bytes);
+    // with optional material the floor stays the must-keep body + contract:
+    // the omission notice is counted on demand, inside the budget
+    let mut with_optional = parts;
+    with_optional.key_changes = Some("k".repeat(7 * 1024));
+    let roomy = handoff::assemble(HandoffMode::FirstRun, &t, with_optional, "zh", 8 * 1024).unwrap();
+    let floor_only = handoff::assemble(
+        HandoffMode::FirstRun,
+        &t,
+        first_run_parts(),
+        "zh",
+        roomy.bill.required_bytes,
+    )
+    .expect("floor budget fits the must-keep body + contract alone");
+    assert_eq!(floor_only.bill.omitted_count, 0);
+    assert_eq!(floor_only.bill.bytes, roomy.bill.required_bytes);
 }
