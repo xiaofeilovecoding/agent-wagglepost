@@ -48,18 +48,20 @@ def smoke_start_outside_source(exe: Path) -> dict:
         (tdp / "managed").mkdir()
         (tdp / "LICENSE").write_bytes(Path(__file__).resolve().parent.parent.joinpath("LICENSE").read_bytes())
         standalone.write_bytes(exe.read_bytes())
-        # doctor probe from the isolated directory (no source tree around it)
+        # doctor probe from the isolated directory (no source tree around it).
+        # W03: subprocess pipes are read as BYTES and decoded explicitly as
+        # UTF-8 — the Windows default (cp1252) mangles the doctor JSON and
+        # must never be relied on, with or without PYTHONUTF8.
         doc = subprocess.run(
             [str(standalone), "doctor", "--json"],
             capture_output=True,
-            text=True,
             timeout=60,
             cwd=str(tdp),
         )
         if doc.returncode != 0:
             raise SystemExit(f"doctor probe failed outside the source tree: rc={doc.returncode}")
         try:
-            doctor = json.loads(doc.stdout)
+            doctor = json.loads(doc.stdout.decode("utf-8"))
         except json.JSONDecodeError as e:
             raise SystemExit(f"doctor output not JSON: {e}")
         # loopback serve probe: the same binary serves the embedded UI anywhere
@@ -114,9 +116,9 @@ def sample_walk_from_zip(zip_path: Path, workdir: Path) -> dict:
 
     import uuid
 
-    # All paths absolute: the child process resolves its arguments against its
-    # own cwd, so a relative root would land somewhere else entirely.
-    workdir = workdir.resolve()
+    # W03: the walk runs from the OPERATING SYSTEM temp directory — the
+    # release directory must only ever contain the ZIP and its digest.
+    workdir = Path(tempfile.mkdtemp(prefix="wp-zip-sample-")).resolve()
     zip_path = zip_path.resolve()
     extract_dir = workdir / f"zip-sample-{uuid.uuid4().hex[:8]}"
     extract_dir.mkdir(parents=True)
@@ -215,6 +217,9 @@ def sample_walk_from_zip(zip_path: Path, workdir: Path) -> dict:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        import shutil
+
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _sample_walk_body(call, get_task, run_until, state, port) -> dict:
@@ -326,8 +331,9 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     version = args.version
     if not version:
-        ver = subprocess.run([str(args.exe), "--version"], capture_output=True, text=True, timeout=30)
-        version = ver.stdout.strip().split()[-1] if ver.stdout.strip() else "dev"
+        ver = subprocess.run([str(args.exe), "--version"], capture_output=True, timeout=30)
+        ver_out = ver.stdout.decode("utf-8", "replace").strip()
+        version = ver_out.split()[-1] if ver_out else "dev"
 
     smoke = smoke_start_outside_source(args.exe)
     if not version or version == "dev":
@@ -358,15 +364,21 @@ def main() -> int:
             z.write(f, arcname=f"{stage.name}/{f.name}")
     zip_sum = out / f"{zip_path.name}.sha256"
     zip_sum.write_text(f"{sha256_of(zip_path)}  {zip_path.name}\n", encoding="utf-8")
+    exe_sha = sha256_of(exe_dst)
+    # W03: the release directory produces ONLY the ZIP and its external digest
+    # — the unpacked staging copy is removed after archiving.
+    import shutil
+
+    shutil.rmtree(stage, ignore_errors=True)
     # W01: prove the PACKED exe works — extract from the zip into a fresh
-    # directory outside the source tree and walk the no-account sample.
+    # directory in the OS temp tree and walk the no-account sample.
     sample = sample_walk_from_zip(zip_path, out)
     print(
         json.dumps(
             {
                 "zip": zip_path.name,
                 "zip_sha256": sha256_of(zip_path),
-                "exe_sha256": sha256_of(exe_dst),
+                "exe_sha256": exe_sha,
                 "smoke": smoke,
                 "sample_walk": sample,
             }
