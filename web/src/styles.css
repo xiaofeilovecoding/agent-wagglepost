@@ -39,6 +39,17 @@ code{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere;font-siz
 .agenttask{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .linkbtn{border:0;padding:2px 4px;min-height:0;text-decoration:underline;color:var(--brand);font-weight:650}
 /* U3 handoff bill */
+.bill-summary { display: grid; gap: 8px; padding: 4px 2px 12px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+.bill-title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 15px; }
+.bill-amount { color: var(--muted); font-variant-numeric: tabular-nums; }
+.bill-amount strong { color: var(--text); font-size: 21px; }
+.bill-meter { display: block; width: 100%; height: 12px; accent-color: var(--brand); }
+.bill-meter::-webkit-meter-bar { background: var(--line); border: 0; }
+.bill-meter::-webkit-meter-optimum-value { background: var(--brand); }
+.bill-digest summary { width: fit-content; cursor: pointer; color: var(--brand); }
+.bill-digest { font-size: 12px; }
+.bill-digest > code { display: block; margin-top: 6px; padding: 8px; background: var(--surface); overflow-wrap: anywhere; user-select: all; }
+
 .handoff-bill{border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin:9px 0;background:var(--bg)}
 .bill-head{font-size:13px}
 .bill-list{list-style:none;margin:7px 0;padding:0;display:grid;gap:4px;font-size:12.5px}
