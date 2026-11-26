@@ -345,6 +345,12 @@ def main():
             page.wait_for_selector(".handoff-bill", timeout=15000)
             bill_text = page.locator(".handoff-bill").inner_text()
             assert "digest" in bill_text.lower(), "bill names the digest"
+            meter = page.locator(".bill-meter")
+            assert 0 < float(meter.get_attribute("value")) <= float(meter.get_attribute("max"))
+            page.locator(".bill-digest summary").click()
+            digest = page.locator(".bill-digest > code").inner_text()
+            assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+
             assert ("字节" in bill_text) or ("bytes" in bill_text), "bill shows byte counts"
             assert ("对照" in bill_text) or ("Comparison" in bill_text), "bill shows the comparison payload"
             assert ("工作树" in bill_text) or ("worktree" in bill_text), "bill binds the worktree identity"

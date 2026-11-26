@@ -421,12 +421,23 @@ function BillPanel({ lang, bill, identity }: { lang: Lang; bill: any; identity: 
   const incl = (bill.included || []).filter((s: any) => !s.must);
   return (
     <div className="handoff-bill" data-testid="handoff-bill">
-      <p className="bill-head">
-        <strong>{lang === "zh" ? "将发送的范围" : "Scope to be sent"}</strong>{" "}
-        {bill.bytes} {t("bytes", lang)} · {lang === "zh" ? "预算" : "budget"} {bill.budget_bytes} · digest{" "}
-        <code>{String(bill.sha256).slice(0, 10)}</code>
-        {bill.truncated ? <span className="tag warn">{lang === "zh" ? "本次有省略" : "omissions this time"}</span> : null}
-      </p>
+      <div className="bill-summary">
+        <div className="bill-title">
+          <strong>{lang === "zh" ? "将发送的范围" : "Scope to be sent"}</strong>
+          {bill.truncated && <span className="tag warn">{lang === "zh" ? "本次有省略" : "Omissions"}</span>}
+        </div>
+        <div className="bill-amount">
+          <strong>{bill.bytes.toLocaleString(lang)}</strong> / {bill.budget_bytes.toLocaleString(lang)} {t("bytes", lang)}
+        </div>
+        {bill.budget_bytes > 0 && (
+          <meter className="bill-meter" min={0} max={bill.budget_bytes} value={bill.bytes}
+            aria-label={lang === "zh" ? "交接预算使用量" : "Handoff budget used"} />
+        )}
+        <details className="bill-digest">
+          <summary>{lang === "zh" ? "核对 digest" : "Verify digest"} <code>{String(bill.sha256).slice(0, 10)}</code></summary>
+          <code>{bill.sha256}</code>
+        </details>
+      </div>
       <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
         {lang === "zh" ? "必须发送（必保留，从不裁剪）" : "Must send (must-keep, never trimmed)"} ·{" "}
         {lang === "zh" ? "下限" : "floor"} {bill.required_bytes} {t("bytes", lang)}
