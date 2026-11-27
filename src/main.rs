@@ -1,4 +1,4 @@
-//! wagglepost — CLI + server entry. Same binary serves the loopback Web UI and the CLI.
+//! WagglePost — CLI + server entry. Same binary serves the loopback Web UI and the CLI.
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ fn real_main(args: Vec<String>) -> i32 {
 
 fn print_usage() {
     eprintln!(
-        "wagglepost 0.2 — 蜂递：本地多 Agent 路由 / local multi-agent router\n\
+        "WagglePost 0.2 — 本地多 Agent 路由 / local multi-agent router\n\
          \n\
          USAGE:\n\
            wagglepost serve [--port N] [--managed-root DIR] [--cli-repo DIR]...\n\
@@ -180,7 +180,7 @@ fn cmd_serve(args: Vec<String>) -> i32 {
             port,
         });
         let ui_router = router(state).fallback(wagglepost::http::api_or_static_fallback);
-        eprintln!("蜂递 WagglePost serving on http://127.0.0.1:{port}");
+        eprintln!("WagglePost serving on http://127.0.0.1:{port}");
         eprintln!("startup code: {startup_code}");
         eprintln!("managed root: {}", managed_root.display());
         eprintln!("cli session: {}", cli_file.display());
@@ -213,7 +213,7 @@ fn cmd_doctor(args: Vec<String>) -> i32 {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&doc).unwrap());
     } else {
-        println!("wagglepost doctor");
+        println!("WagglePost doctor");
         for a in doc["adapters"].as_array().unwrap_or(&vec![]) {
             let id = a["id"].as_str().unwrap_or("?");
             let v = a["version"].as_str().unwrap_or("-");

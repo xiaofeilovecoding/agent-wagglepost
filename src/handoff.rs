@@ -5,9 +5,9 @@ use serde_json::json;
 pub const DEFAULT_BODY_BUDGET: usize = 8 * 1024;
 /// Notice prepended when optional material had to be omitted to fit the budget.
 pub const TRUNCATED_NOTICE_ZH: &str =
-    "【蜂递】正文超出预算，部分可选材料被整段省略；完整变更清单保存在受管工作区。";
+    "【WagglePost】正文超出预算，部分可选材料被整段省略；完整变更清单保存在受管工作区。";
 pub const TRUNCATED_NOTICE_EN: &str =
-    "[wagglepost] Body exceeded the budget; some optional material was omitted whole. The full change list stays in the managed workspace.";
+    "[WagglePost] Body exceeded the budget; some optional material was omitted whole. The full change list stays in the managed workspace.";
 
 /// Role-specific structured-result footer appended to every dispatch body.
 /// Tells the agent how to report done / needs_decision / blocked.

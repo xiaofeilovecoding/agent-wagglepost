@@ -32,13 +32,13 @@ The handoff bill from the same run — the full candidate body versus what is ac
 
 | Bill item | Bytes |
 | --- | --- |
-| Must-keep floor (must-keep content + titles + separators + reporting contract + notice reserve) | 3,062 |
-| Actually delivered body (all must-keep complete + optional material + omission notice) | 4,566 |
+| Must-keep floor (must-keep content + titles + separators + reporting contract) | 2,946 |
+| Actually delivered body (all must-keep complete + optional material) | 4,566 |
 | Comparison: locally constructed naive full re-brief (reference only, never sent) | 5,743 |
 
 Delivered 4,566 bytes < comparison 5,743 bytes; all six must-keep fields arrive complete and the unique ending sentence survives verbatim at the end of the goal section. This is the everything-fits scenario; the numbers come from the deterministic test `tests/wp_evidence.rs` (fixed input → fixed bytes); rerun it locally for the same numbers.
 
-The really-omitted scenario comes from the same real dispatch path (the reviewer handoff, where the writer touched 300 files and the change-path list exceeded the budget and was omitted whole): must-keep floor 1,258 bytes, delivered 1,521 bytes, comparison 97,779 bytes, 1 item omitted with the omission notice; the bilingual acceptance and the unique ending sentence still arrive complete. Both scenarios are real runs of `tests/wp_evidence.rs`, labeled as such here.
+The really-omitted scenario comes from the same real dispatch path (the reviewer handoff, where the writer touched 300 files and the change-path list exceeded the budget and was omitted whole): must-keep floor 1,258 bytes, delivered 1,525 bytes, comparison 97,779 bytes, 1 item omitted with the omission notice; the bilingual acceptance and the unique ending sentence still arrive complete. Both scenarios are real runs of `tests/wp_evidence.rs`, labeled as such here.
 
 ## 3-minute demo with no account (fully simulated, zero model calls)
 
@@ -93,7 +93,7 @@ Capabilities live on a five-state ladder: **not installed → needs setup → pr
 
 Notes:
 
-- **What "experimental writer" means**: the runtime cannot natively confine its shell/write tools to the managed worktree (wagglepost adds Job Object tree containment, the single-writer lock and the worktree boundary, but "the process could write outside the worktree" cannot be excluded by the vendor's own mechanism), so it never auto-routes and cannot be dispatched as a writer at all (the dispatch gate refuses it); experimental roles are shown honestly in the capability table awaiting a provable native confinement mechanism, and even a successful real run does not lift the mark.
+- **What "experimental writer" means**: the runtime cannot natively confine its shell/write tools to the managed worktree (WagglePost adds Job Object tree containment, the single-writer lock and the worktree boundary, but "the process could write outside the worktree" cannot be excluded by the vendor's own mechanism), so it never auto-routes and cannot be dispatched as a writer at all (the dispatch gate refuses it); experimental roles are shown honestly in the capability table awaiting a provable native confinement mechanism, and even a successful real run does not lift the mark.
 - **Your machine will differ**: `wagglepost doctor --json` reports the real local state; `wagglepost verify <adapter>` runs the offline no-account contract (version + help transport flags) and writes the verification record; the first real task then upgrades the evidence to real_loop.
 - Capabilities are only claimed where version and role have evidence; version drift invalidates verification and asks for a re-run.
 

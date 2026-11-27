@@ -92,9 +92,35 @@ fn budget_must_keep_never_trimmed_optional_omitted_whole() {
     assert!(!a.body.text.contains("kkkkk"), "oversized optional omitted whole");
     assert_eq!(a.bill.omitted_count, 1);
     assert!(a.bill.truncated);
-    assert!(a.body.text.contains("【蜂递】正文超出预算"), "notice present, never silent");
+    assert!(a.body.text.contains("【WagglePost】正文超出预算"), "notice present, never silent");
     assert!(a.body.bytes <= 8 * 1024, "delivered bytes respect the budget");
     assert!(a.bill.excluded.iter().any(|s| s.reason.as_deref() == Some("over_budget_omitted")));
+}
+
+#[test]
+fn budget_omission_notice_fits_exactly_or_is_omitted_whole() {
+    let task = task();
+    for (lang, notice, prefix) in [
+        ("zh", handoff::TRUNCATED_NOTICE_ZH, "【WagglePost】正文超出预算"),
+        ("en", handoff::TRUNCATED_NOTICE_EN, "[WagglePost] Body exceeded the budget"),
+    ] {
+        let mode = HandoffMode::FirstRun;
+        let mut parts = first_run_parts();
+        let baseline = handoff::assemble(mode, &task, parts.clone(), lang, 8 * 1024).unwrap();
+        parts.key_changes = Some("k".repeat(8 * 1024));
+        let expected = format!("{notice}\n\n{}", baseline.body.text);
+        let exact = handoff::assemble(mode, &task, parts.clone(), lang, expected.len()).unwrap();
+        assert!(exact.body.text.starts_with(prefix));
+        assert_eq!(exact.body.text, expected);
+        assert_eq!(exact.body.bytes, expected.len());
+        assert_eq!(exact.bill.bytes, expected.len());
+        assert_eq!(exact.bill.omitted_count, 1);
+
+        let tight = handoff::assemble(mode, &task, parts, lang, expected.len() - 1).unwrap();
+        assert_eq!(tight.body.text, baseline.body.text);
+        assert_eq!(tight.bill.bytes, baseline.body.text.len());
+        assert_eq!(tight.bill.omitted_count, 1);
+    }
 }
 
 #[test]
@@ -225,7 +251,7 @@ fn budget_exact_fit_and_byte_exact_accounting() {
     let exact = handoff::assemble(HandoffMode::FirstRun, &t, parts, "zh", roomy.bill.required_bytes).unwrap();
     assert_eq!(exact.body.bytes, roomy.bill.required_bytes, "exact fit lands on the limit");
     assert!(!exact.bill.truncated);
-    assert!(!exact.body.text.contains("【蜂递】"), "no notice when nothing is omitted");
+    assert!(!exact.body.text.contains("【WagglePost】"), "no notice when nothing is omitted");
     assert_eq!(exact.body.sha256, roomy.body.sha256, "identical body at exact budget");
 }
 
@@ -415,7 +441,7 @@ fn budget_chinese_reference_exact_boundary() {
     assert_eq!(one_under.bill.refs_omitted, 1);
     assert!(one_under.bill.truncated);
     assert!(!one_under.body.text.contains(&zh_ref));
-    assert!(!one_under.body.text.contains("【蜂递】"), "notice only ships when it fits");
+    assert!(!one_under.body.text.contains("【WagglePost】"), "notice only ships when it fits");
 }
 
 #[test]

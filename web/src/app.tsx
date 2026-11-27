@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { api, ApiError, randomIdem, setCsrf } from "./api";
-import { Lang, t, statusText } from "./i18n";
+import { BRAND, Lang, t, statusText } from "./i18n";
 
 // ---------- types ----------
 type Task = any;
@@ -198,7 +198,7 @@ function MotionStage({
       </svg>
       <div className="motion-labels">
         <span>{t("taskEntrance", lang)}</span>
-        <span>{t("hub", lang)}</span>
+        <span>{BRAND}</span>
         <span>{outLabel}</span>
       </div>
       <div className="receipt-slot">
@@ -389,8 +389,8 @@ function StatusBar({
           })}
           <p className="muted" style={{ fontSize: 12 }}>
             {lang === "zh"
-              ? "详情只覆盖蜂递任务，不读取全机会话。"
-              : "Covers wagglepost tasks only; machine-wide sessions are never read."}
+              ? "详情只覆盖 WagglePost 任务，不读取全机会话。"
+              : "Covers WagglePost tasks only; machine-wide sessions are never read."}
           </p>
         </div>
       )}
@@ -750,7 +750,7 @@ function App() {
             <path d="M8 15l4-5 7 3-4 6-5-1z" fill="currentColor" />
             <circle cx="15" cy="14" r="1.2" fill="var(--side)" stroke="none" />
           </svg>
-          <span>{t("brand", lang)}</span>
+          <span>{BRAND}</span>
         </div>
         <nav className="nav" aria-label="main">
           <button data-nav="desk" aria-pressed={nav === "desk"} onClick={() => { setNav("desk"); setSelected(null); setSnap(null); }}>{t("desk", lang)}</button>
@@ -762,7 +762,7 @@ function App() {
       <main>
         <header className="top">
           <div className="row">
-            <strong>wagglepost</strong>
+            <strong>{BRAND}</strong>
             <span className="muted">/</span>
             <code>v{("0.2.0")}</code>
           </div>
@@ -866,7 +866,7 @@ function Gate({ onOk, lang }: { onOk: () => void; lang: Lang }) {
   return (
     <div className="gate">
       <div className="panel">
-        <span className="eyebrow">{t("brand", lang)}</span>
+        <span className="eyebrow">{BRAND}</span>
         <h2>{t("sessionGate", lang)}</h2>
         <input
           value={code}

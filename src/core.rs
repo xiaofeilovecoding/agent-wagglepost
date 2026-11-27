@@ -302,7 +302,7 @@ impl Core {
         if !dir.join(".git").exists() {
             std::fs::write(dir.join("README.md"), "# demo
 
-Sample repository for the offline wagglepost tour.
+Sample repository for the offline WagglePost tour.
 ").ok();
             // freshly created directories can transiently fail CreateProcess cwd
             // validation on Windows; retry a few times before giving up
@@ -1605,7 +1605,7 @@ Sample repository for the offline wagglepost tour.
                 if kind == "decision" {
                     return Some(json!({
                         "behaviors": ["write_files"],
-                        "files": {"README.md": "# demo\n\nSample repository for the offline wagglepost tour.\npartial work (simulated)\n"},
+                        "files": {"README.md": "# demo\n\nSample repository for the offline WagglePost tour.\npartial work (simulated)\n"},
                         "result": {
                             "status": "needs_decision",
                             "question": "保留已写内容并继续吗？",
@@ -1616,7 +1616,7 @@ Sample repository for the offline wagglepost tour.
                 if kind == "reroute" {
                     return Some(json!({
                         "behaviors": ["write_files", "quota_block"],
-                        "files": {"README.md": "# demo\n\nSample repository for the offline wagglepost tour.\nquota-blocked partial work (simulated)\n"}
+                        "files": {"README.md": "# demo\n\nSample repository for the offline WagglePost tour.\nquota-blocked partial work (simulated)\n"}
                     }));
                 }
             }

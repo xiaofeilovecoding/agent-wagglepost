@@ -1,6 +1,6 @@
 ---
 name: Bug report / 缺陷报告
-about: Report a defect in WagglePost / 报告蜂递的缺陷
+about: Report a defect in WagglePost / 报告 WagglePost 的缺陷
 labels: bug
 ---
 
