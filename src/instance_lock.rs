@@ -47,7 +47,7 @@ pub fn acquire(managed_root: &std::path::Path) -> Result<InstanceGuard, String> 
             windows_sys::Win32::Foundation::CloseHandle(handle);
         }
         Err(format!(
-            "another wagglepost instance is already running for this managed root (mutex {key})"
+            "another WagglePost instance is already running for this managed root (mutex {key})"
         ))
     }
     #[cfg(not(windows))]
@@ -59,7 +59,7 @@ pub fn acquire(managed_root: &std::path::Path) -> Result<InstanceGuard, String> 
                 if let Ok(pid) = pid.trim().parse::<u32>() {
                     if proc_alive(pid) {
                         return Err(format!(
-                            "another wagglepost instance is already running for this managed root (pid {pid})"
+                            "another WagglePost instance is already running for this managed root (pid {pid})"
                         ));
                     }
                 }

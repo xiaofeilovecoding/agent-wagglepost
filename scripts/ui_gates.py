@@ -123,10 +123,13 @@ def main():
         def g1_gate_and_desk():
             page.goto(BASE)
             page.wait_for_selector(".gate input")
+            assert page.title() == "WagglePost"
+            assert page.locator(".gate .eyebrow").inner_text() == "WagglePost"
             page.fill(".gate input", CODE)
             page.click(".gate .primary")
             page.wait_for_selector(".shell .side .nav")
-            assert page.locator(".logo span").inner_text() in ("蜂递", "WagglePost")
+            assert page.locator(".logo span").inner_text() == "WagglePost"
+            assert page.locator(".top .row strong").inner_text() == "WagglePost"
 
         gate("g6_gate_and_desk", g1_gate_and_desk)
 
@@ -252,7 +255,7 @@ def main():
             first = page.locator(".agentchip").first
             first.click()
             page.wait_for_selector(".agentdetail", timeout=5000)
-            assert "蜂递任务" in page.locator(".agentdetail").inner_text() or "wagglepost tasks" in page.locator(".agentdetail").inner_text()
+            assert "WagglePost 任务" in page.locator(".agentdetail").inner_text()
             focused = page.evaluate("document.activeElement.className")
             # Escape returns focus to the trigger point
             page.keyboard.press("Escape")
@@ -397,10 +400,15 @@ def main():
 
         def g6_lang_toggle_keeps_task():
             before = page.locator(".detail h2").inner_text()
+            assert page.locator(".motion-labels span").nth(1).inner_text() == "WagglePost"
             page.click("#language")
             page.wait_for_timeout(300)
             after = page.locator(".detail h2").inner_text()
             assert before != after, "language toggle re-renders text"
+            assert page.title() == "WagglePost"
+            assert page.locator(".logo span").inner_text() == "WagglePost"
+            assert page.locator(".top .row strong").inner_text() == "WagglePost"
+            assert page.locator(".motion-labels span").nth(1).inner_text() == "WagglePost"
             assert page.locator(".detail > div .tag").first.inner_text() != ""
             page.click("#language")  # back to zh
             page.wait_for_timeout(200)

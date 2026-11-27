@@ -528,7 +528,7 @@ pub fn freeze_candidate(
     let pre = observe_worktree(cfg, &wt.path)?;
     // add all changes including untracked
     run_git(cfg, p, &["add", "-A"], None)?;
-    let msg = format!("wagglepost candidate: task {} attempt {} g{}", task.task_id, attempt_id, generation);
+    let msg = format!("WagglePost candidate: task {} attempt {} g{}", task.task_id, attempt_id, generation);
     run_git(
         cfg,
         p,

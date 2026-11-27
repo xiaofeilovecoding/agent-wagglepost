@@ -321,9 +321,11 @@ Review scenario: long optional evidence is omitted whole.";
     assert!(body.contains("Must-keep fields arrive complete"));
     // the oversized change paths are NOT in the delivered body; the notice is
     assert!(!body.contains("tracked-evidence-299.txt"), "omitted optional stays out");
-    assert!(body.contains("【蜂递】正文超出预算"), "omission notice present");
+    assert!(body.contains("【WagglePost】正文超出预算"), "omission notice present");
     // floor reflects must-keep body + contract; delivered bytes within budget
     let delivered = review_preview["handoff"]["bytes"].as_u64().unwrap();
+    assert_eq!(delivered, body.len() as u64);
+    assert_eq!(bill["bytes"], delivered);
     let floor = bill["required_bytes"].as_u64().unwrap();
     assert!(delivered <= 8 * 1024);
     assert!(floor <= delivered);

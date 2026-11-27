@@ -1,7 +1,8 @@
 export type Lang = "zh" | "en";
 
+export const BRAND = "WagglePost";
+
 export const T = {
-  brand: { zh: "蜂递", en: "WagglePost" },
   desk: { zh: "工作台", en: "Desk" },
   tools: { zh: "工具", en: "Tools" },
   history: { zh: "历史", en: "History" },
@@ -12,7 +13,6 @@ export const T = {
   route: { zh: "路线", en: "Route" },
   messagesArtifacts: { zh: "消息与产物", en: "Messages and artifacts" },
   taskEntrance: { zh: "任务入口", en: "Task" },
-  hub: { zh: "蜂递", en: "WagglePost" },
   runner: { zh: "执行站", en: "Runner" },
   altRunner: { zh: "备用执行站", en: "Alternate runner" },
   resultReturn: { zh: "结果回收", en: "Result" },
